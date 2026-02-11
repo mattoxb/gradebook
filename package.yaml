@@ -1,0 +1,64 @@
+name:                gradebook
+version:             0.1.0.0
+github:              "mattox/gradebook"
+license:             BSD3
+author:              "Mattox"
+maintainer:          "mattox@example.com"
+copyright:           "2026 Mattox"
+
+extra-source-files:
+- CLAUDE.md
+
+description:         CS421 Gradebook Manager
+
+dependencies:
+- base >= 4.7 && < 5
+- optparse-applicative >= 0.18
+- yaml >= 0.11
+- aeson >= 2.0
+- text >= 2.0
+- bytestring >= 0.11
+- cassava >= 0.5          # CSV parsing
+- vector >= 0.13
+- HDBC >= 2.4
+- HDBC-sqlite3 >= 2.3
+# - HDBC-postgresql >= 2.5  # Add back when needed
+- process >= 1.6          # for fzf integration
+- directory >= 1.3
+- filepath >= 1.4
+
+library:
+  source-dirs: src
+  ghc-options:
+  - -Wall
+  - -Wcompat
+  - -Widentities
+  - -Wincomplete-record-updates
+  - -Wincomplete-uni-patterns
+  - -Wmissing-home-modules
+  - -Wpartial-fields
+  - -Wredundant-constraints
+
+executables:
+  gb:
+    main:                Main.hs
+    source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    - -Wall
+    dependencies:
+    - gradebook
+
+tests:
+  gradebook-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - gradebook
+    - hspec >= 2.11

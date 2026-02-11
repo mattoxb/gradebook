@@ -1,0 +1,18 @@
+resolver: lts-23.28  # GHC 9.8.4
+
+packages:
+  - .
+
+# Use system GHC from Nix
+system-ghc: true
+install-ghc: false
+
+# Nix integration
+nix:
+  enable: true
+  packages: [sqlite, zlib]
+
+# Extra dependencies not in the resolver
+extra-deps:
+  # - HDBC-postgresql-2.5.0.1@sha256:37bb911cd996d12c91fa711002877f32f91bcc488de76d85a05865c3af9dc580,3032
+  - HDBC-sqlite3-2.3.3.1@sha256:5025fd94d02b9b3f0b8b8233796dd9a85a0b3dda6503c6e671e3eddbc51cb4d4,2424
