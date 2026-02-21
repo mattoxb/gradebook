@@ -1,2 +1,0 @@
-database: cs421-grades-sp26.db
-db-type: sqlite3  # or postgresql

@@ -26,6 +26,7 @@ dependencies:
 - process >= 1.6          # for fzf integration
 - directory >= 1.3
 - filepath >= 1.4
+- unordered-containers >= 0.2  # HashMap for grading config
 
 library:
   source-dirs: src
