@@ -126,11 +126,11 @@ commandParser = hsubparser
     ( info loadScoresParser
       ( progDesc "Load scores CSV into the database" )
     )
-  <> command "generate-report"
+  <> command "report"
     ( info generateReportParser
       ( progDesc "Generate grade report for a student" )
     )
-  <> command "mark-collected"
+  <> command "collect"
     ( info markCollectedParser
       ( progDesc "Mark assignment(s) as collected (updates DB and CSV)" )
     )
