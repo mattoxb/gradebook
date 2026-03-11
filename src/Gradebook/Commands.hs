@@ -24,13 +24,14 @@ import System.Directory (findExecutable, doesFileExist)
 import Control.Exception (catch, try, SomeException)
 import Control.Monad (when)
 import Data.Maybe (isJust)
+import qualified Data.Set as Set
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Csv as Csv
 import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
 import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, Assignment(..), Score(..))
+import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids)
 import Gradebook.Roster (parseRosterCSV)
 import Gradebook.Categories (parseCategoriesCSV)
 import Gradebook.Assignments (parseAssignmentsCSV)
@@ -175,44 +176,54 @@ runLoadScores scoresPath = do
   -- Initialize database schema (ensures tables exist)
   initDatabase conn
 
-  -- Insert each score, handling foreign key errors
-  insertedCount <- insertScoresWithWarnings conn scores 0
+  -- Get valid assignment slugs and student netids for pre-validation
+  validAssignments <- getAllAssignmentSlugs conn
+  validStudents <- getAllStudentNetids conn
+
+  let assignmentSet = Set.fromList validAssignments
+      studentSet = Set.fromList validStudents
+
+  -- Validate scores and partition into valid/invalid
+  let (validScores, warnings, errors) = validateScores assignmentSet studentSet scores
+
+  -- Print warnings for missing students
+  mapM_ putStrLn warnings
+
+  -- Error out if any assignments are missing
+  case errors of
+    (err:_) -> do
+      putStrLn err
+      disconnect conn
+      exitFailure
+    [] -> return ()
+
+  -- Insert valid scores
+  mapM_ (insertScore conn) validScores
 
   -- Commit and close
   commit conn
   disconnect conn
 
-  putStrLn $ "Successfully loaded " ++ show insertedCount ++ " score entries into database"
+  putStrLn $ "Successfully loaded " ++ show (length validScores) ++ " score entries into database"
+  when (not $ null warnings) $
+    putStrLn $ "Skipped " ++ show (length warnings) ++ " scores for unknown students"
 
--- | Insert scores one by one, catching foreign key errors
--- Returns the count of successfully inserted scores
-insertScoresWithWarnings :: ConnWrapper -> [Score] -> Int -> IO Int
-insertScoresWithWarnings _ [] count = return count
-insertScoresWithWarnings conn (score:rest) count = do
-  result <- try (insertScore conn score) :: IO (Either SqlError ())
-  case result of
-    Right () -> insertScoresWithWarnings conn rest (count + 1)
-    Left err -> do
-      let errMsg = seErrorMsg err
-      -- Check if it's a foreign key violation
-      if "foreign key" `isInfixOfCI` errMsg || "FOREIGN KEY" `isInfixOfCI` errMsg
-        then do
-          -- Determine if it's a student or assignment FK violation
-          if "students" `isInfixOfCI` errMsg || "netid" `isInfixOfCI` errMsg
-            then do
-              -- Missing student - warn and continue
-              putStrLn $ "Warning: Student '" ++ T.unpack (scoreNetId score) ++ "' not found in database, skipping score"
-              insertScoresWithWarnings conn rest count
-            else do
-              -- Missing assignment - error out
-              putStrLn $ "Error: Assignment '" ++ T.unpack (scoreAssignment score) ++ "' not found in database"
-              exitFailure
-        else do
-          -- Some other error - rethrow
-          putStrLn $ "Database error: " ++ errMsg
-          exitFailure
+-- | Validate scores against known assignments and students
+-- Returns (valid scores, warnings for missing students, errors for missing assignments)
+validateScores :: Set.Set T.Text -> Set.Set T.Text -> [Score] -> ([Score], [String], [String])
+validateScores assignmentSet studentSet = foldr checkScore ([], [], [])
   where
-    isInfixOfCI needle haystack = T.isInfixOf (T.toLower $ T.pack needle) (T.toLower $ T.pack haystack)
+    checkScore score (valid, warns, errs)
+      -- Check assignment first - missing assignment is an error
+      | not (Set.member (scoreAssignment score) assignmentSet) =
+          let err = "Error: Assignment '" ++ T.unpack (scoreAssignment score) ++ "' not found in database"
+          in (valid, warns, err : errs)
+      -- Check student - missing student is a warning
+      | not (Set.member (scoreNetId score) studentSet) =
+          let warn = "Warning: Student '" ++ T.unpack (scoreNetId score) ++ "' not found in database, skipping score"
+          in (valid, warn : warns, errs)
+      -- Both valid
+      | otherwise = (score : valid, warns, errs)
 
 -- | Search for a student using fzf and output their netid
 runSearchNetId :: IO ()

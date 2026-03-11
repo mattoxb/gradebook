@@ -14,6 +14,8 @@ module Gradebook.Database
   , getAssignmentsByCategory
   , getScoresForStudent
   , getAllCategories
+  , getAllAssignmentSlugs
+  , getAllStudentNetids
   ) where
 
 import Database.HDBC
@@ -374,3 +376,15 @@ getAllCategories :: IConnection conn => conn -> IO [T.Text]
 getAllCategories conn = do
   results <- quickQuery' conn "SELECT slug FROM categories ORDER BY slug" []
   return $ map (\[slug'] -> fromSql slug') results
+
+-- | Get all assignment slugs from the database
+getAllAssignmentSlugs :: IConnection conn => conn -> IO [T.Text]
+getAllAssignmentSlugs conn = do
+  results <- quickQuery' conn "SELECT slug FROM assignments" []
+  return $ map (\[slug'] -> fromSql slug') results
+
+-- | Get all student netids from the database
+getAllStudentNetids :: IConnection conn => conn -> IO [T.Text]
+getAllStudentNetids conn = do
+  results <- quickQuery' conn "SELECT netid FROM students" []
+  return $ map (\[netid'] -> fromSql netid') results

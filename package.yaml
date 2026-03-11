@@ -27,6 +27,7 @@ dependencies:
 - directory >= 1.3
 - filepath >= 1.4
 - unordered-containers >= 0.2  # HashMap for grading config
+- containers >= 0.6            # Set for score validation
 
 library:
   source-dirs: src
