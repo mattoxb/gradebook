@@ -119,8 +119,8 @@ initDatabase conn = do
       , "  category TEXT NOT NULL,"
       , "  max_points INTEGER NOT NULL,"
       , "  title TEXT NOT NULL,"
-      , "  collected INTEGER NOT NULL DEFAULT 0,"
-      , "  FOREIGN KEY (category) REFERENCES categories(slug)"
+      , "  collected BOOLEAN NOT NULL DEFAULT FALSE,"
+      , "  FOREIGN KEY (category) REFERENCES categories(slug) ON DELETE CASCADE"
       , ")"
       ]
 
@@ -129,10 +129,10 @@ initDatabase conn = do
       , "  netid TEXT NOT NULL,"
       , "  assignment TEXT NOT NULL,"
       , "  score REAL,"
-      , "  excused INTEGER NOT NULL DEFAULT 0,"
+      , "  excused BOOLEAN NOT NULL DEFAULT FALSE,"
       , "  PRIMARY KEY (netid, assignment),"
-      , "  FOREIGN KEY (netid) REFERENCES students(netid),"
-      , "  FOREIGN KEY (assignment) REFERENCES assignments(slug)"
+      , "  FOREIGN KEY (netid) REFERENCES students(netid) ON DELETE CASCADE,"
+      , "  FOREIGN KEY (assignment) REFERENCES assignments(slug) ON DELETE CASCADE"
       , ")"
       ]
 
@@ -165,11 +165,32 @@ insertStudent conn student = do
   return ()
   where
     insertSQL = unlines
-      [ "INSERT OR REPLACE INTO students"
+      [ "INSERT INTO students"
       , "(netid, uin, admit_term, gender, name, email, credit, level, year,"
       , " subject, number, section, crn, degree_name, major_1_name, college,"
       , " program_code, program_name, ferpa, honors_credit, advisors)"
       , "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      , "ON CONFLICT (netid) DO UPDATE SET"
+      , "  uin = EXCLUDED.uin,"
+      , "  admit_term = EXCLUDED.admit_term,"
+      , "  gender = EXCLUDED.gender,"
+      , "  name = EXCLUDED.name,"
+      , "  email = EXCLUDED.email,"
+      , "  credit = EXCLUDED.credit,"
+      , "  level = EXCLUDED.level,"
+      , "  year = EXCLUDED.year,"
+      , "  subject = EXCLUDED.subject,"
+      , "  number = EXCLUDED.number,"
+      , "  section = EXCLUDED.section,"
+      , "  crn = EXCLUDED.crn,"
+      , "  degree_name = EXCLUDED.degree_name,"
+      , "  major_1_name = EXCLUDED.major_1_name,"
+      , "  college = EXCLUDED.college,"
+      , "  program_code = EXCLUDED.program_code,"
+      , "  program_name = EXCLUDED.program_name,"
+      , "  ferpa = EXCLUDED.ferpa,"
+      , "  honors_credit = EXCLUDED.honors_credit,"
+      , "  advisors = EXCLUDED.advisors"
       ]
 
 -- | Search for students by netid, name, email, or UIN
@@ -209,7 +230,12 @@ insertCategory conn category = do
     ]
   return ()
   where
-    insertSQL = "INSERT OR REPLACE INTO categories (slug, title) VALUES (?, ?)"
+    insertSQL = unlines
+      [ "INSERT INTO categories (slug, title)"
+      , "VALUES (?, ?)"
+      , "ON CONFLICT (slug) DO UPDATE SET"
+      , "  title = EXCLUDED.title"
+      ]
 
 -- | Insert an assignment into the database
 insertAssignment :: IConnection conn => conn -> Assignment -> IO ()
@@ -226,9 +252,16 @@ insertAssignment conn assignment = do
   return ()
   where
     insertSQL = unlines
-      [ "INSERT OR REPLACE INTO assignments"
+      [ "INSERT INTO assignments"
       , "(slug, order_num, start_date, category, max_points, title, collected)"
       , "VALUES (?, ?, ?, ?, ?, ?, ?)"
+      , "ON CONFLICT (slug) DO UPDATE SET"
+      , "  order_num = EXCLUDED.order_num,"
+      , "  start_date = EXCLUDED.start_date,"
+      , "  category = EXCLUDED.category,"
+      , "  max_points = EXCLUDED.max_points,"
+      , "  title = EXCLUDED.title,"
+      , "  collected = EXCLUDED.collected"
       ]
 
 -- | Insert a score into the database
@@ -243,9 +276,12 @@ insertScore conn score = do
   return ()
   where
     insertSQL = unlines
-      [ "INSERT OR REPLACE INTO scores"
+      [ "INSERT INTO scores"
       , "(netid, assignment, score, excused)"
       , "VALUES (?, ?, ?, ?)"
+      , "ON CONFLICT (netid, assignment) DO UPDATE SET"
+      , "  score = EXCLUDED.score,"
+      , "  excused = EXCLUDED.excused"
       ]
 
 -- | Get all assignments for a specific category
@@ -270,7 +306,23 @@ getAssignmentsByCategory conn categorySlug = do
         (fromSql slug')
         (fromSql maxPoints')
         (fromSql title')
-        (fromSql collected')
+        (sqlValueToBool' collected')
+      where
+        -- Helper to convert SqlValue to Bool (handles both INTEGER and TEXT)
+        sqlValueToBool' :: SqlValue -> Bool
+        sqlValueToBool' SqlNull = False
+        sqlValueToBool' (SqlBool b) = b
+        sqlValueToBool' (SqlInteger 0) = False
+        sqlValueToBool' (SqlInteger _) = True
+        sqlValueToBool' (SqlInt32 0) = False
+        sqlValueToBool' (SqlInt32 _) = True
+        sqlValueToBool' (SqlInt64 0) = False
+        sqlValueToBool' (SqlInt64 _) = True
+        sqlValueToBool' (SqlString "False") = False
+        sqlValueToBool' (SqlString "false") = False
+        sqlValueToBool' (SqlString "0") = False
+        sqlValueToBool' (SqlString "") = False
+        sqlValueToBool' _ = True
     rowToAssignment _ = error "Unexpected row format from assignments query"
 
 -- | Get all scores for a specific student
@@ -293,15 +345,29 @@ getScoresForStudent conn netid = do
       , case score' of
           SqlNull -> Nothing
           _ -> Just (fromSql score')
-      , case excused' of
-          SqlNull -> False
-          _ -> fromSql excused'
+      , sqlValueToBool excused'
       , fromSql maxPoints'
       , fromSql category'
       , fromSql title'
-      , fromSql collected'
+      , sqlValueToBool collected'
       )
     rowToScoreTuple _ = error "Unexpected row format from scores query"
+
+    -- Helper to convert SqlValue to Bool (handles INTEGER, TEXT, and BOOLEAN)
+    sqlValueToBool :: SqlValue -> Bool
+    sqlValueToBool SqlNull = False
+    sqlValueToBool (SqlBool b) = b
+    sqlValueToBool (SqlInteger 0) = False
+    sqlValueToBool (SqlInteger _) = True
+    sqlValueToBool (SqlInt32 0) = False
+    sqlValueToBool (SqlInt32 _) = True
+    sqlValueToBool (SqlInt64 0) = False
+    sqlValueToBool (SqlInt64 _) = True
+    sqlValueToBool (SqlString "False") = False
+    sqlValueToBool (SqlString "false") = False
+    sqlValueToBool (SqlString "0") = False
+    sqlValueToBool (SqlString "") = False
+    sqlValueToBool _ = True
 
 -- | Get all category slugs from the database
 getAllCategories :: IConnection conn => conn -> IO [T.Text]

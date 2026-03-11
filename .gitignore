@@ -1,6 +1,5 @@
 # Haskell build artifacts
 .stack-work/
-*.cabal
 dist/
 dist-newstyle/
 *.hi
@@ -24,3 +23,4 @@ dist-newstyle/
 # Nix
 result
 result-*
+*.lock

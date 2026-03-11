@@ -9,23 +9,8 @@ import qualified Data.Csv as Csv
 import qualified Data.Vector as V
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Csv (FromRecord(..), ToRecord(..), ToField(..), FromField(..), ToNamedRecord(..), FromNamedRecord(..), namedRecord, (.:), (.!), (.=))
+import Data.Csv (ToRecord(..), ToField(..), FromField(..), ToNamedRecord(..), FromNamedRecord(..), namedRecord, (.:), (.=))
 import Gradebook.Database (Assignment(..))
-
--- | Make Assignment an instance of FromRecord for CSV parsing
-instance FromRecord Assignment where
-  parseRecord v
-    | V.length v == 7 = do
-        order' <- v .! 0
-        startDate' <- v .! 1
-        category' <- v .! 2
-        slug' <- v .! 3
-        maxPoints' <- v .! 4
-        title' <- v .! 5
-        collectedInt <- v .! 6 :: Csv.Parser Int
-        let collected' = collectedInt /= 0
-        return $ Assignment order' startDate' category' slug' maxPoints' title' collected'
-    | otherwise = fail $ "Expected 7 fields, got " ++ show (V.length v)
 
 -- | Make Assignment an instance of ToRecord for CSV encoding
 instance ToRecord Assignment where
@@ -70,6 +55,6 @@ instance FromNamedRecord Assignment where
 parseAssignmentsCSV :: FilePath -> IO (Either String [Assignment])
 parseAssignmentsCSV filepath = do
   csvData <- BL.readFile filepath
-  case Csv.decode Csv.HasHeader csvData of
+  case Csv.decodeByName csvData of
     Left err -> return $ Left err
-    Right records -> return $ Right $ V.toList records
+    Right (_, records) -> return $ Right $ V.toList records

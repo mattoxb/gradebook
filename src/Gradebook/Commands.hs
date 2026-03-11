@@ -13,8 +13,8 @@ module Gradebook.Commands
   ) where
 
 import Database.HDBC
-import Database.HDBC.Sqlite3 (connectSqlite3, Connection)
--- import Database.HDBC.PostgreSQL (connectPostgreSQL)
+import Database.HDBC.Sqlite3 (connectSqlite3)
+import Database.HDBC.PostgreSQL (connectPostgreSQL)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import System.Process (readProcess)
@@ -30,7 +30,7 @@ import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
 import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, Assignment(..))
+import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, Assignment(..), Score(..))
 import Gradebook.Roster (parseRosterCSV)
 import Gradebook.Categories (parseCategoriesCSV)
 import Gradebook.Assignments (parseAssignmentsCSV)
@@ -39,14 +39,18 @@ import Gradebook.GradeCalculation (calculateGrades)
 import Gradebook.Reports (generateReport)
 
 -- | Open database connection based on config
-openConnection :: Config -> IO Connection
+-- Returns a ConnWrapper to allow different backend types
+openConnection :: Config -> IO ConnWrapper
 openConnection config = case dbType config of
   SQLite -> do
     conn <- connectSqlite3 (T.unpack $ database config)
     -- Enable foreign key constraints (must be done per connection)
     _ <- quickQuery' conn "PRAGMA foreign_keys = ON" []
-    return conn
-  PostgreSQL -> error "PostgreSQL support not yet implemented. Please use SQLite."
+    return (ConnWrapper conn)
+  PostgreSQL -> do
+    let connStr = "dbname=" ++ T.unpack (database config)
+    conn <- connectPostgreSQL connStr
+    return (ConnWrapper conn)
 
 -- | Load roster CSV into database
 runLoadRoster :: FilePath -> IO ()
@@ -171,14 +175,44 @@ runLoadScores scoresPath = do
   -- Initialize database schema (ensures tables exist)
   initDatabase conn
 
-  -- Insert each score
-  mapM_ (insertScore conn) scores
+  -- Insert each score, handling foreign key errors
+  insertedCount <- insertScoresWithWarnings conn scores 0
 
   -- Commit and close
   commit conn
   disconnect conn
 
-  putStrLn $ "Successfully loaded " ++ show (length scores) ++ " score entries into database"
+  putStrLn $ "Successfully loaded " ++ show insertedCount ++ " score entries into database"
+
+-- | Insert scores one by one, catching foreign key errors
+-- Returns the count of successfully inserted scores
+insertScoresWithWarnings :: ConnWrapper -> [Score] -> Int -> IO Int
+insertScoresWithWarnings _ [] count = return count
+insertScoresWithWarnings conn (score:rest) count = do
+  result <- try (insertScore conn score) :: IO (Either SqlError ())
+  case result of
+    Right () -> insertScoresWithWarnings conn rest (count + 1)
+    Left err -> do
+      let errMsg = seErrorMsg err
+      -- Check if it's a foreign key violation
+      if "foreign key" `isInfixOfCI` errMsg || "FOREIGN KEY" `isInfixOfCI` errMsg
+        then do
+          -- Determine if it's a student or assignment FK violation
+          if "students" `isInfixOfCI` errMsg || "netid" `isInfixOfCI` errMsg
+            then do
+              -- Missing student - warn and continue
+              putStrLn $ "Warning: Student '" ++ T.unpack (scoreNetId score) ++ "' not found in database, skipping score"
+              insertScoresWithWarnings conn rest count
+            else do
+              -- Missing assignment - error out
+              putStrLn $ "Error: Assignment '" ++ T.unpack (scoreAssignment score) ++ "' not found in database"
+              exitFailure
+        else do
+          -- Some other error - rethrow
+          putStrLn $ "Database error: " ++ errMsg
+          exitFailure
+  where
+    isInfixOfCI needle haystack = T.isInfixOf (T.toLower $ T.pack needle) (T.toLower $ T.pack haystack)
 
 -- | Search for a student using fzf and output their netid
 runSearchNetId :: IO ()
