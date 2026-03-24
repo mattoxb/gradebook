@@ -6,6 +6,8 @@ module Gradebook.Commands
   , runLoadCategories
   , runLoadAssignments
   , runLoadScores
+  , runLoadExam
+  , runLoadExamOverrides
   , runGenerateReport
   , runMarkCollected
   , runSearchNetId
@@ -22,22 +24,27 @@ import System.Exit (exitFailure)
 import qualified System.Directory
 import System.Directory (findExecutable, doesFileExist)
 import Control.Exception (catch, try, SomeException)
-import Control.Monad (when)
+import Control.Monad (when, foldM)
 import Data.Maybe (isJust)
 import qualified Data.Set as Set
+import qualified Data.Map.Strict as M
+import Data.List (find)
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Csv as Csv
 import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
-import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids)
+import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), GradingMode(..), ExamConfig(..), RetakePolicy(..), loadConfig)
+import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, updateAssignmentScore, getExamZonesForExam, applyExamQuestionOverride)
+import Gradebook.ExamScores (PrairieLearnRow(..), parsePrairieLearnCSV, extractNetId, groupByStudent, buildExamZones, buildQuestionScores)
+import Gradebook.ExamOverrides (ExamOverride(..), parseExamOverridesCSV)
+import Gradebook.GradeCalculation (calculateExamScore, ExamGrade(..), ZoneGrade(..), QuestionGrade(..))
 import Gradebook.Roster (parseRosterCSV)
 import Gradebook.Categories (parseCategoriesCSV)
 import Gradebook.Assignments (parseAssignmentsCSV)
 import Gradebook.Scores (parseScoresCSV)
-import Gradebook.GradeCalculation (calculateGrades)
-import Gradebook.Reports (generateReport)
+import Gradebook.GradeCalculation (calculateGrades, evaluateRequirements)
+import Gradebook.Reports (generateReport, generatePassFailReport, generateLetterGradeReport, formatExamSection)
 
 -- | Open database connection based on config
 -- Returns a ConnWrapper to allow different backend types
@@ -318,13 +325,29 @@ runGenerateReportForOne maybeNetid pushToGit = do
       -- Get scores for student
       scores <- getScoresForStudent conn netid
 
+      -- Get exam grades for all configured exams
+      examGrades <- mapM (buildExamGradeForStudent conn gradingCfg netid) (exams gradingCfg)
+
       disconnect conn
 
       -- Calculate grades
       let categoryGrades = calculateGrades gradingCfg scores
 
-      -- Generate report
-      let report = generateReport netid categoryGrades
+      -- Generate report based on grading mode
+      let baseReport = case gradingMode gradingCfg of
+            Weighted ->
+              generateReport netid categoryGrades
+            PassFail ->
+              let reqResults = evaluateRequirements (passRequirements gradingCfg) categoryGrades
+              in generatePassFailReport netid categoryGrades reqResults
+            LetterGrade ->
+              generateLetterGradeReport netid categoryGrades (gradeThresholds gradingCfg)
+
+      -- Append exam detail sections
+      let examSections = concatMap formatExamGradeIfPresent (zip (exams gradingCfg) examGrades)
+          report = if null examSections
+                   then baseReport
+                   else baseReport <> "\n" <> T.unlines examSections
 
       -- Output or push report
       if pushToGit
@@ -338,6 +361,106 @@ runGenerateReportForOne maybeNetid pushToGit = do
         else do
           -- Print to console
           TIO.putStrLn report
+
+-- | Format exam grade section if student has scores for that exam
+formatExamGradeIfPresent :: (ExamConfig, Maybe ExamGrade) -> [T.Text]
+formatExamGradeIfPresent (_, maybeGrade) =
+  case maybeGrade of
+    Nothing -> []
+    Just grade -> formatExamSection grade 0.20  -- Weight is shown in main category breakdown
+
+-- | Build ExamGrade for a student from database
+buildExamGradeForStudent :: IConnection conn => conn -> GradingConfig -> T.Text -> ExamConfig -> IO (Maybe ExamGrade)
+buildExamGradeForStudent conn gradingCfg netid examCfg = do
+  -- Get zones for this exam
+  zones <- getExamZonesForExam conn (examSlug examCfg)
+
+  if null zones
+    then return Nothing
+    else do
+      -- Get question scores for original exam
+      originalScores <- getExamQuestionScoresForStudent conn netid (examSlug examCfg)
+
+      -- Get retake scores if configured
+      retakeScores <- case examRetakeSlug examCfg of
+        Nothing -> return []
+        Just retakeSlug -> getExamQuestionScoresForStudent conn netid retakeSlug
+
+      -- Get final scores if configured
+      finalScores <- case examFinalSlug examCfg of
+        Nothing -> return []
+        Just finalSlug -> getExamQuestionScoresForStudent conn netid finalSlug
+
+      if null originalScores
+        then return Nothing
+        else do
+          -- Build zone grades
+          let zoneGrades = map (buildZoneGrade originalScores retakeScores finalScores (examRetakePolicy examCfg)) zones
+
+          -- Calculate overall percentage (average of zone percentages)
+          let overallPct = if null zoneGrades
+                           then 0
+                           else sum (map zgPercentage zoneGrades) / fromIntegral (length zoneGrades)
+
+          return $ Just ExamGrade
+            { egExamSlug = examSlug examCfg
+            , egExamTitle = examTitle examCfg
+            , egZones = zoneGrades
+            , egPercentage = overallPct
+            }
+
+-- | Build a ZoneGrade from question scores
+buildZoneGrade :: [ExamQuestionScore] -> [ExamQuestionScore] -> [ExamQuestionScore] -> RetakePolicy -> ExamZone -> ZoneGrade
+buildZoneGrade originalScores retakeScores finalScores retakePolicy zone =
+  let
+    zoneNum = ezZoneNumber zone
+    -- Filter scores for this zone
+    origForZone = filter (\s -> eqsZoneNumber s == zoneNum) originalScores
+    retakeForZone = filter (\s -> eqsZoneNumber s == zoneNum) retakeScores
+    finalForZone = filter (\s -> eqsZoneNumber s == zoneNum) finalScores
+
+    -- Build question grades
+    questionGrades = map (buildQuestionGrade origForZone retakeForZone finalForZone retakePolicy) [1..ezQuestionCount zone]
+
+    -- Calculate zone percentage (average of question combined scores)
+    zonePct = if null questionGrades
+              then 0
+              else sum (map qgCombinedScore questionGrades) / fromIntegral (length questionGrades) / 100
+  in ZoneGrade
+       { zgZoneNumber = zoneNum
+       , zgZoneTitle = ezZoneTitle zone
+       , zgQuestions = questionGrades
+       , zgPercentage = zonePct
+       }
+
+-- | Build a QuestionGrade from scores
+buildQuestionGrade :: [ExamQuestionScore] -> [ExamQuestionScore] -> [ExamQuestionScore] -> RetakePolicy -> Int -> QuestionGrade
+buildQuestionGrade origScores retakeScores finalScores retakePolicy qNum =
+  let
+    findScore scores = find (\s -> eqsQuestionNumber s == qNum) scores
+    toPercent s = (eqsScore s / eqsMaxPoints s) * 100
+
+    origScore = toPercent <$> findScore origScores
+    retakeScore = toPercent <$> findScore retakeScores
+    finalScore = toPercent <$> findScore finalScores
+
+    -- Combine scores using policy
+    combined = case (origScore, retakeScore) of
+      (Nothing, Nothing) -> 0
+      (Just o, Nothing) -> o
+      (Nothing, Just r) -> r
+      (Just o, Just r) -> case retakePolicy of
+        MaxScore -> max o r
+        MaxIfBetterAvgIfWorse -> if r >= o then r else (o + r) / 2
+        WeightedRetake w -> (1 - w) * o + w * r
+
+  in QuestionGrade
+       { qgQuestionNumber = qNum
+       , qgOriginalScore = origScore
+       , qgRetakeScore = retakeScore
+       , qgFinalScore = finalScore
+       , qgCombinedScore = combined
+       }
 
 -- | Generate and push reports for all students
 runGenerateReportForAll :: IO ()
@@ -383,8 +506,8 @@ runGenerateReportForAll = do
 
 -- | Generate and push report for a single student (helper for bulk processing)
 generateAndPushForStudent :: Config -> GradingConfig -> String -> (T.Text, T.Text, T.Text, T.Text) -> IO ()
-generateAndPushForStudent config gradingCfg repoPrefix (netid, name, _, _) = do
-  putStrLn $ "Processing: " ++ T.unpack netid ++ " (" ++ T.unpack name ++ ")"
+generateAndPushForStudent config gradingCfg prefix (netid, studentName, _, _) = do
+  putStrLn $ "Processing: " ++ T.unpack netid ++ " (" ++ T.unpack studentName ++ ")"
 
   -- Connect to database
   conn <- openConnection config
@@ -396,11 +519,18 @@ generateAndPushForStudent config gradingCfg repoPrefix (netid, name, _, _) = do
   -- Calculate grades
   let categoryGrades = calculateGrades gradingCfg scores
 
-  -- Generate report
-  let report = generateReport netid categoryGrades
+  -- Generate report based on grading mode
+  let report = case gradingMode gradingCfg of
+        Weighted ->
+          generateReport netid categoryGrades
+        PassFail ->
+          let reqResults = evaluateRequirements (passRequirements gradingCfg) categoryGrades
+          in generatePassFailReport netid categoryGrades reqResults
+        LetterGrade ->
+          generateLetterGradeReport netid categoryGrades (gradeThresholds gradingCfg)
 
   -- Push to git
-  pushReportToGit (T.unpack netid) repoPrefix report
+  pushReportToGit (T.unpack netid) prefix report
     `catch` (\(e :: SomeException) -> do
       putStrLn $ "  ERROR: " ++ show e
     )
@@ -501,6 +631,299 @@ pushReportToGit netid repoPrefix report = do
           )
 
     putStrLn "Successfully pushed grade report!"
+
+-- | Load exam scores from PrairieLearn CSV
+runLoadExam :: String -> FilePath -> IO ()
+runLoadExam examSlugStr scoresPath = do
+  let examSlugT = T.pack examSlugStr
+  putStrLn $ "Loading exam scores for: " ++ examSlugStr
+  putStrLn $ "From file: " ++ scoresPath
+
+  -- Load config
+  config <- loadConfig "config.yaml"
+
+  -- Check if grading config exists and find exam config
+  case grading config of
+    Nothing -> do
+      putStrLn "Error: No grading configuration found in config.yaml"
+      exitFailure
+    Just gradingCfg -> do
+      -- Find the exam configuration for this slug
+      let examConfigs = exams gradingCfg
+          -- Check if this is a primary exam or a retake
+          (examCfg, isRetake, primarySlug) = findExamConfig examSlugT examConfigs
+
+      case examCfg of
+        Nothing -> do
+          putStrLn $ "Warning: No exam configuration found for slug '" ++ examSlugStr ++ "'"
+          putStrLn "Proceeding without retake policy (scores will be stored but not combined)"
+          loadExamScoresSimple config examSlugT scoresPath
+        Just cfg -> do
+          if isRetake
+            then do
+              putStrLn $ "This is a retake exam for: " ++ T.unpack primarySlug
+              putStrLn $ "Retake policy: " ++ show (examRetakePolicy cfg)
+              loadExamScoresWithRetake config cfg examSlugT primarySlug scoresPath
+            else do
+              putStrLn "This is a primary exam"
+              loadExamScoresSimple config examSlugT scoresPath
+
+-- | Find exam config and determine if slug is primary or retake
+-- Returns (Maybe ExamConfig, isRetake, primarySlug)
+findExamConfig :: T.Text -> [ExamConfig] -> (Maybe ExamConfig, Bool, T.Text)
+findExamConfig slug configs =
+  -- First check if it's a primary exam slug
+  case find (\c -> examSlug c == slug) configs of
+    Just cfg -> (Just cfg, False, slug)
+    Nothing ->
+      -- Check if it's a retake slug
+      case find (\c -> examRetakeSlug c == Just slug) configs of
+        Just cfg -> (Just cfg, True, examSlug cfg)
+        Nothing -> (Nothing, False, slug)
+
+-- | Load exam scores without retake combination (simple case)
+loadExamScoresSimple :: Config -> T.Text -> FilePath -> IO ()
+loadExamScoresSimple config examSlugT scoresPath = do
+  -- Parse PrairieLearn CSV
+  result <- parsePrairieLearnCSV scoresPath
+  rows <- case result of
+    Left err -> do
+      putStrLn $ "Error parsing CSV: " ++ err
+      exitFailure
+    Right r -> return r
+
+  putStrLn $ "Parsed " ++ show (length rows) ++ " question score rows"
+
+  -- Connect to database
+  conn <- openConnection config
+
+  -- Initialize database schema (ensures exam tables exist)
+  initDatabase conn
+
+  -- Get valid student netids
+  validStudents <- getAllStudentNetids conn
+  let studentSet = Set.fromList validStudents
+
+  -- Build exam zones from the data
+  let zones = buildExamZones examSlugT rows
+  putStrLn $ "Found " ++ show (length zones) ++ " exam zones"
+
+  -- Insert exam zones
+  mapM_ (insertExamZone conn) zones
+
+  -- Group rows by student and process each
+  let byStudent = groupByStudent rows
+      studentCount = M.size byStudent
+
+  putStrLn $ "Processing scores for " ++ show studentCount ++ " students..."
+
+  -- Process each student
+  processedCount <- foldM (processStudentExamScoresSimple conn studentSet examSlugT) 0 (M.toList byStudent)
+
+  -- Commit and close
+  commit conn
+  disconnect conn
+
+  putStrLn $ "Successfully loaded exam scores for " ++ show processedCount ++ " students"
+
+-- | Process exam scores for a single student (simple case, no retake)
+processStudentExamScoresSimple :: IConnection conn => conn -> Set.Set T.Text -> T.Text -> Int -> (T.Text, [PrairieLearnRow]) -> IO Int
+processStudentExamScoresSimple conn studentSet examSlugT count (netid, studentRows) = do
+  -- Skip if student not in database
+  if not (Set.member netid studentSet)
+    then do
+      putStrLn $ "Warning: Student '" ++ T.unpack netid ++ "' not found, skipping"
+      return count
+    else do
+      -- Build and insert question scores
+      let questionScores = buildQuestionScores examSlugT netid studentRows
+      mapM_ (insertExamQuestionScore conn) questionScores
+
+      -- Calculate overall exam score (average of zone averages)
+      let scoreTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- questionScores]
+          examScore = calculateExamScore MaxScore Nothing scoreTuples [] []
+
+      -- Update the exam assignment score
+      updateAssignmentScore conn netid examSlugT examScore
+
+      return (count + 1)
+
+-- | Load exam scores with retake combination
+loadExamScoresWithRetake :: Config -> ExamConfig -> T.Text -> T.Text -> FilePath -> IO ()
+loadExamScoresWithRetake config examCfg retakeSlug primarySlug scoresPath = do
+  -- Parse PrairieLearn CSV
+  result <- parsePrairieLearnCSV scoresPath
+  rows <- case result of
+    Left err -> do
+      putStrLn $ "Error parsing CSV: " ++ err
+      exitFailure
+    Right r -> return r
+
+  putStrLn $ "Parsed " ++ show (length rows) ++ " question score rows"
+
+  -- Connect to database
+  conn <- openConnection config
+
+  -- Initialize database schema
+  initDatabase conn
+
+  -- Get valid student netids
+  validStudents <- getAllStudentNetids conn
+  let studentSet = Set.fromList validStudents
+
+  -- Build exam zones (retake should have same structure as primary)
+  let zones = buildExamZones retakeSlug rows
+  putStrLn $ "Found " ++ show (length zones) ++ " exam zones"
+
+  -- Insert exam zones for retake
+  mapM_ (insertExamZone conn) zones
+
+  -- Group rows by student
+  let byStudent = groupByStudent rows
+      studentCount = M.size byStudent
+
+  putStrLn $ "Processing retake scores for " ++ show studentCount ++ " students..."
+
+  -- Process each student with retake logic
+  processedCount <- foldM (processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug) 0 (M.toList byStudent)
+
+  -- Commit and close
+  commit conn
+  disconnect conn
+
+  putStrLn $ "Successfully processed retake scores for " ++ show processedCount ++ " students"
+
+-- | Process retake scores for a single student and combine with original
+processStudentRetakeScores :: IConnection conn => conn -> Set.Set T.Text -> ExamConfig -> T.Text -> T.Text -> Int -> (T.Text, [PrairieLearnRow]) -> IO Int
+processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug count (netid, studentRows) = do
+  -- Skip if student not in database
+  if not (Set.member netid studentSet)
+    then do
+      putStrLn $ "Warning: Student '" ++ T.unpack netid ++ "' not found, skipping"
+      return count
+    else do
+      -- Build and insert retake question scores
+      let retakeScores = buildQuestionScores retakeSlug netid studentRows
+      mapM_ (insertExamQuestionScore conn) retakeScores
+
+      -- Get original exam scores
+      originalScores <- getExamQuestionScoresForStudent conn netid primarySlug
+
+      -- Convert to the format expected by calculateExamScore
+      let origTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- originalScores]
+          retakeTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- retakeScores]
+
+      -- Calculate combined score using retake policy
+      let combinedScore = calculateExamScore
+            (examRetakePolicy examCfg)
+            Nothing  -- No final policy for now
+            origTuples
+            retakeTuples
+            []  -- No final scores
+
+      -- Update the primary exam assignment score
+      updateAssignmentScore conn netid primarySlug combinedScore
+
+      putStrLn $ "  " ++ T.unpack netid ++ ": combined score = " ++ show (combinedScore * 100) ++ "%"
+
+      return (count + 1)
+
+-- | Load exam question score overrides from CSV
+runLoadExamOverrides :: String -> FilePath -> IO ()
+runLoadExamOverrides examSlugStr overridesPath = do
+  let examSlugT = T.pack examSlugStr
+  putStrLn $ "Loading exam overrides for: " ++ examSlugStr
+  putStrLn $ "From file: " ++ overridesPath
+
+  -- Load config
+  config <- loadConfig "config.yaml"
+
+  -- Parse overrides CSV
+  result <- parseExamOverridesCSV overridesPath
+  overrides <- case result of
+    Left err -> do
+      putStrLn $ "Error parsing CSV: " ++ err
+      exitFailure
+    Right o -> return o
+
+  putStrLn $ "Parsed " ++ show (length overrides) ++ " override entries"
+
+  -- Connect to database
+  conn <- openConnection config
+
+  -- Initialize database schema (ensures tables exist with new column)
+  initDatabase conn
+
+  -- Get valid student netids for validation
+  validStudents <- getAllStudentNetids conn
+  let studentSet = Set.fromList validStudents
+
+  -- Apply each override
+  appliedCount <- foldM (applyOverride conn studentSet examSlugT) 0 overrides
+
+  -- Now recalculate exam scores for affected students
+  let affectedNetids = Set.fromList [eoNetId o | o <- overrides, Set.member (eoNetId o) studentSet]
+  putStrLn $ "Recalculating exam scores for " ++ show (Set.size affectedNetids) ++ " affected students..."
+
+  -- Get exam config for retake policy
+  case grading config of
+    Nothing -> putStrLn "Warning: No grading config, using simple score calculation"
+    Just gradingCfg -> do
+      let examCfg = find (\c -> examSlug c == examSlugT) (exams gradingCfg)
+      mapM_ (recalculateStudentExamScore conn examSlugT examCfg) (Set.toList affectedNetids)
+
+  -- Commit and close
+  commit conn
+  disconnect conn
+
+  putStrLn $ "Successfully applied " ++ show appliedCount ++ " overrides"
+
+-- | Apply a single override (helper)
+applyOverride :: IConnection conn => conn -> Set.Set T.Text -> T.Text -> Int -> ExamOverride -> IO Int
+applyOverride conn studentSet examSlugT count override = do
+  let netid = eoNetId override
+  if not (Set.member netid studentSet)
+    then do
+      putStrLn $ "Warning: Student '" ++ T.unpack netid ++ "' not found, skipping"
+      return count
+    else do
+      applyExamQuestionOverride conn
+        netid
+        examSlugT
+        (eoZoneNumber override)
+        (eoQuestionNumber override)
+        (eoScore override)
+        (eoMaxPoints override)
+        (eoReason override)
+      putStrLn $ "  Applied override for " ++ T.unpack netid ++
+                 " zone " ++ show (eoZoneNumber override) ++
+                 " question " ++ show (eoQuestionNumber override) ++
+                 ": " ++ T.unpack (eoReason override)
+      return (count + 1)
+
+-- | Recalculate a student's exam score after overrides
+recalculateStudentExamScore :: IConnection conn => conn -> T.Text -> Maybe ExamConfig -> T.Text -> IO ()
+recalculateStudentExamScore conn examSlugT maybeExamCfg netid = do
+  -- Get all question scores for this student on this exam
+  questionScores <- getExamQuestionScoresForStudent conn netid examSlugT
+
+  if null questionScores
+    then putStrLn $ "  Warning: No scores found for " ++ T.unpack netid
+    else do
+      -- Get retake scores if configured
+      retakeScores <- case maybeExamCfg >>= examRetakeSlug of
+        Nothing -> return []
+        Just retakeSlug -> getExamQuestionScoresForStudent conn netid retakeSlug
+
+      -- Calculate combined score
+      let scoreTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- questionScores]
+          retakeTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- retakeScores]
+          retakePolicy = maybe MaxScore examRetakePolicy maybeExamCfg
+          newScore = calculateExamScore retakePolicy Nothing scoreTuples retakeTuples []
+
+      -- Update the exam score
+      updateAssignmentScore conn netid examSlugT newScore
+      putStrLn $ "  " ++ T.unpack netid ++ ": new score = " ++ show (newScore * 100) ++ "%"
 
 -- | Mark assignments as collected (updates both DB and CSV)
 runMarkCollected :: [String] -> IO ()

@@ -1,0 +1,284 @@
+{
+    "type": "Exam",
+    "title": "Midterm 1",
+    "uuid": "89cc6b27-4e3a-4102-9dc5-a3cebbc799a7",
+    "set": "Exam",
+    "module": "Exams",
+    "number": "1",
+    "allowAccess": [
+        {
+            "examUuid": "5123e849-9385-4bea-9335-674751d03d83",
+            "credit": 100
+        },
+        {
+            "examUuid": "2103a285-4d0f-40ff-801e-c91113238cd0",
+            "credit": 100
+        },
+        {
+            "examUuid": "9b909fd4-0286-4fd7-912f-3e395a750388",
+            "credit": 100
+        },
+        {
+            "examUuid": "d48b0154-c6c8-494d-a941-4d35d98d17b0",
+            "credit": 100
+        }
+    ],
+    "zones": [
+        {
+            "title": "Direct Recursion",
+            "questions": [
+                {
+                    "numberChoose": 1,
+                    "points": [
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10
+                    ],
+                    "alternatives": [
+                        {
+                            "id": "code-haskell/list-recursion/flipzip"
+                        },
+                        {
+                            "id": "code-haskell/list-recursion/listsubtractn"
+                        },
+                        {
+                            "id": "code-haskell/list-recursion/minlist"
+                        },
+                        {
+                            "id": "code-haskell/list-recursion/mulList"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Tail Recursion",
+            "questions": [
+                {
+                    "numberChoose": 1,
+                    "points": [
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10
+                    ],
+                    "alternatives": [
+                        {
+                            "id": "code-haskell/tail-recursion/fact"
+                        },
+                        {
+                            "id": "code-haskell/tail-recursion/maxList"
+                        },
+                        {
+                            "id": "code-haskell/tail-recursion/minList"
+                        },
+                        {
+                            "id": "code-haskell/tail-recursion/natList"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Tail Recursion Advantage",
+            "questions": [
+                {
+                    "numberChoose": 1,
+                    "points": [
+                        10,
+                        8,
+                        0
+                    ],
+                    "alternatives": [
+                        {
+                            "id": "mc/tail-recursion/advantage-02"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Algebraic Data Types",
+            "questions": [
+                {
+                    "numberChoose": 1,
+                    "points": [
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10
+                    ],
+                    "alternatives": [
+                        {
+                            "id": "code-haskell/adts/cons2list_sumCons"
+                        },
+                        {
+                            "id": "code-haskell/adts/pair2tuple_sumTuple"
+                        },
+                        {
+                            "id": "code-haskell/adts/tuple2pair_prodTuple"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Writing HOFs",
+            "questions": [
+                {
+                    "numberChoose": 1,
+                    "points": [
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10
+                    ],
+                    "alternatives": [
+                        {
+                            "id": "code-haskell/hof-writing/each"
+                        },
+                        {
+                            "id": "code-haskell/hof-writing/map"
+                        },
+                        {
+                            "id": "code-haskell/hof-writing/filter"
+                        },
+                        {
+                            "id": "code-haskell/hof-writing/takeWhile"
+                        },
+                        {
+                            "id": "code-haskell/hof-writing/foldl"
+                        },
+                        {
+                            "id": "code-haskell/hof-writing/foldr"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Using HOFs",
+            "questions": [
+                {
+                    "numberChoose": 1,
+                    "points": [
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10
+                    ],
+                    "alternatives": [
+                        {
+                            "id": "code-haskell/hof-using/allEven"
+                        },
+                        {
+                            "id": "code-haskell/hof-using/evenOdd"
+                        },
+                        {
+                            "id": "code-haskell/hof-using/decList"
+                        },
+                        {
+                            "id": "code-haskell/hof-using/doubleEvens"
+                        },
+                        {
+                            "id": "code-haskell/hof-using/maxList"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Lambda Calculus",
+            "questions": [
+                {
+                    "numberChoose": 1,
+                    "points": [
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10
+                    ],
+                    "alternatives": [
+                        {
+                            "id": "lambda-calculus/evaluation/reduce-v1"
+                        }
+                    ]
+                }
+            ]
+        }
+        ,
+        {
+            "title": "Big Step Semantics",
+            "questions": [
+                {
+                    "numberChoose": 1,
+                    "points": [
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10,
+                        10
+                    ],
+                    "alternatives": [
+                        {
+                            "id": "big-step-semantics/proofs/seq1"
+                        }
+                    ]
+                }
+            ]
+        }
+    ],
+    "text": "Midterm 1"
+}

@@ -1,0 +1,14 @@
+database: test-grades.db
+db-type: sqlite3
+
+grading:
+  mode: weighted
+  categories:
+    exams:
+      weight: 0.20
+      drop-lowest: 0
+  exams:
+    - slug: exam-1
+      title: "Midterm 1"
+      retake-slug: exam-1-retake
+      retake-policy: max

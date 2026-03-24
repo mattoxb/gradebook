@@ -16,6 +16,15 @@ module Gradebook.Database
   , getAllCategories
   , getAllAssignmentSlugs
   , getAllStudentNetids
+  -- Exam-related exports
+  , ExamZone(..)
+  , ExamQuestionScore(..)
+  , insertExamZone
+  , insertExamQuestionScore
+  , getExamZonesForExam
+  , getExamQuestionScoresForStudent
+  , updateAssignmentScore
+  , applyExamQuestionOverride
   ) where
 
 import Database.HDBC
@@ -71,6 +80,26 @@ data Score = Score
   , scoreExcused   :: Bool
   } deriving (Show, Eq)
 
+-- | Exam zone record (defines structure of an exam)
+data ExamZone = ExamZone
+  { ezExamSlug      :: T.Text   -- ^ Which exam this zone belongs to (e.g., "exam-1")
+  , ezZoneNumber    :: Int      -- ^ Zone ordering number
+  , ezZoneTitle     :: T.Text   -- ^ Zone display title (e.g., "Direct Recursion")
+  , ezQuestionCount :: Int      -- ^ Number of questions in this zone
+  } deriving (Show, Eq)
+
+-- | Exam question score record (individual question scores)
+data ExamQuestionScore = ExamQuestionScore
+  { eqsNetId          :: T.Text        -- ^ Student netid
+  , eqsExamSlug       :: T.Text        -- ^ Exam slug (e.g., "exam-1" or "exam-1r" for retake)
+  , eqsZoneNumber     :: Int           -- ^ Zone number
+  , eqsQuestionNumber :: Int           -- ^ Question number within zone (1-indexed)
+  , eqsQuestionId     :: T.Text        -- ^ PrairieLearn question ID (e.g., "code-haskell/list-recursion/mulList")
+  , eqsScore          :: Double        -- ^ Points earned
+  , eqsMaxPoints      :: Double        -- ^ Maximum possible points
+  , eqsOverrideReason :: Maybe T.Text  -- ^ Reason for manual override (if any)
+  } deriving (Show, Eq)
+
 -- | Initialize the database schema
 initDatabase :: IConnection conn => conn -> IO ()
 initDatabase conn = do
@@ -78,6 +107,8 @@ initDatabase conn = do
   _ <- run conn createCategoriesTableSQL []
   _ <- run conn createAssignmentsTableSQL []
   _ <- run conn createScoresTableSQL []
+  _ <- run conn createExamZonesTableSQL []
+  _ <- run conn createExamQuestionScoresTableSQL []
   commit conn
   where
     createStudentsTableSQL = unlines
@@ -135,6 +166,35 @@ initDatabase conn = do
       , "  PRIMARY KEY (netid, assignment),"
       , "  FOREIGN KEY (netid) REFERENCES students(netid) ON DELETE CASCADE,"
       , "  FOREIGN KEY (assignment) REFERENCES assignments(slug) ON DELETE CASCADE"
+      , ")"
+      ]
+
+    -- Exam zones define the structure of an exam (zone titles and question counts)
+    createExamZonesTableSQL = unlines
+      [ "CREATE TABLE IF NOT EXISTS exam_zones ("
+      , "  exam_slug TEXT NOT NULL,"
+      , "  zone_number INTEGER NOT NULL,"
+      , "  zone_title TEXT NOT NULL,"
+      , "  question_count INTEGER NOT NULL DEFAULT 1,"
+      , "  PRIMARY KEY (exam_slug, zone_number),"
+      , "  FOREIGN KEY (exam_slug) REFERENCES assignments(slug) ON DELETE CASCADE"
+      , ")"
+      ]
+
+    -- Individual question scores for each student on each exam
+    createExamQuestionScoresTableSQL = unlines
+      [ "CREATE TABLE IF NOT EXISTS exam_question_scores ("
+      , "  netid TEXT NOT NULL,"
+      , "  exam_slug TEXT NOT NULL,"
+      , "  zone_number INTEGER NOT NULL,"
+      , "  question_number INTEGER NOT NULL,"
+      , "  question_id TEXT NOT NULL,"      -- PrairieLearn question ID for analysis
+      , "  score REAL NOT NULL,"
+      , "  max_points REAL NOT NULL,"
+      , "  override_reason TEXT,"           -- Reason for manual override (NULL if not overridden)
+      , "  PRIMARY KEY (netid, exam_slug, zone_number, question_number),"
+      , "  FOREIGN KEY (netid) REFERENCES students(netid) ON DELETE CASCADE,"
+      , "  FOREIGN KEY (exam_slug, zone_number) REFERENCES exam_zones(exam_slug, zone_number) ON DELETE CASCADE"
       , ")"
       ]
 
@@ -388,3 +448,139 @@ getAllStudentNetids :: IConnection conn => conn -> IO [T.Text]
 getAllStudentNetids conn = do
   results <- quickQuery' conn "SELECT netid FROM students" []
   return $ map (\[netid'] -> fromSql netid') results
+
+-- | Insert an exam zone into the database
+insertExamZone :: IConnection conn => conn -> ExamZone -> IO ()
+insertExamZone conn zone = do
+  _ <- run conn insertSQL
+    [ toSql $ ezExamSlug zone
+    , toSql $ ezZoneNumber zone
+    , toSql $ ezZoneTitle zone
+    , toSql $ ezQuestionCount zone
+    ]
+  return ()
+  where
+    insertSQL = unlines
+      [ "INSERT INTO exam_zones"
+      , "(exam_slug, zone_number, zone_title, question_count)"
+      , "VALUES (?, ?, ?, ?)"
+      , "ON CONFLICT (exam_slug, zone_number) DO UPDATE SET"
+      , "  zone_title = EXCLUDED.zone_title,"
+      , "  question_count = EXCLUDED.question_count"
+      ]
+
+-- | Insert an exam question score into the database
+insertExamQuestionScore :: IConnection conn => conn -> ExamQuestionScore -> IO ()
+insertExamQuestionScore conn qs = do
+  _ <- run conn insertSQL
+    [ toSql $ eqsNetId qs
+    , toSql $ eqsExamSlug qs
+    , toSql $ eqsZoneNumber qs
+    , toSql $ eqsQuestionNumber qs
+    , toSql $ eqsQuestionId qs
+    , toSql $ eqsScore qs
+    , toSql $ eqsMaxPoints qs
+    , toSql $ eqsOverrideReason qs
+    ]
+  return ()
+  where
+    insertSQL = unlines
+      [ "INSERT INTO exam_question_scores"
+      , "(netid, exam_slug, zone_number, question_number, question_id, score, max_points, override_reason)"
+      , "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      , "ON CONFLICT (netid, exam_slug, zone_number, question_number) DO UPDATE SET"
+      , "  question_id = EXCLUDED.question_id,"
+      , "  score = EXCLUDED.score,"
+      , "  max_points = EXCLUDED.max_points,"
+      , "  override_reason = EXCLUDED.override_reason"
+      ]
+
+-- | Get all exam zones for a specific exam
+getExamZonesForExam :: IConnection conn => conn -> T.Text -> IO [ExamZone]
+getExamZonesForExam conn examSlug = do
+  results <- quickQuery' conn querySQL [toSql examSlug]
+  return $ map rowToExamZone results
+  where
+    querySQL = unlines
+      [ "SELECT exam_slug, zone_number, zone_title, question_count"
+      , "FROM exam_zones"
+      , "WHERE exam_slug = ?"
+      , "ORDER BY zone_number"
+      ]
+
+    rowToExamZone :: [SqlValue] -> ExamZone
+    rowToExamZone [examSlug', zoneNum', zoneTitle', qCount'] =
+      ExamZone
+        (fromSql examSlug')
+        (fromSql zoneNum')
+        (fromSql zoneTitle')
+        (fromSql qCount')
+    rowToExamZone _ = error "Unexpected row format from exam_zones query"
+
+-- | Get all exam question scores for a student on a specific exam
+getExamQuestionScoresForStudent :: IConnection conn => conn -> T.Text -> T.Text -> IO [ExamQuestionScore]
+getExamQuestionScoresForStudent conn netid examSlug = do
+  results <- quickQuery' conn querySQL [toSql netid, toSql examSlug]
+  return $ map (rowToExamQuestionScore netid examSlug) results
+  where
+    querySQL = unlines
+      [ "SELECT zone_number, question_number, question_id, score, max_points, override_reason"
+      , "FROM exam_question_scores"
+      , "WHERE netid = ? AND exam_slug = ?"
+      , "ORDER BY zone_number, question_number"
+      ]
+
+    rowToExamQuestionScore :: T.Text -> T.Text -> [SqlValue] -> ExamQuestionScore
+    rowToExamQuestionScore netid' examSlug' [zoneNum', qNum', qId', score', maxPts', reason'] =
+      ExamQuestionScore
+        netid'
+        examSlug'
+        (fromSql zoneNum')
+        (fromSql qNum')
+        (fromSql qId')
+        (fromSql score')
+        (fromSql maxPts')
+        (case reason' of
+           SqlNull -> Nothing
+           _ -> Just (fromSql reason'))
+    rowToExamQuestionScore _ _ _ = error "Unexpected row format from exam_question_scores query"
+
+-- | Apply an override to an exam question score (takes max of existing and override)
+applyExamQuestionOverride :: IConnection conn => conn -> T.Text -> T.Text -> Int -> Int -> Double -> Double -> T.Text -> IO ()
+applyExamQuestionOverride conn netid examSlug zoneNum qNum overrideScore overrideMaxPts reason = do
+  _ <- run conn updateSQL
+    [ toSql overrideScore
+    , toSql overrideMaxPts
+    , toSql reason
+    , toSql netid
+    , toSql examSlug
+    , toSql zoneNum
+    , toSql qNum
+    ]
+  return ()
+  where
+    -- Use MAX to take the better score; update reason regardless
+    updateSQL = unlines
+      [ "UPDATE exam_question_scores"
+      , "SET score = MAX(score, ?),"
+      , "    max_points = ?,"
+      , "    override_reason = ?"
+      , "WHERE netid = ? AND exam_slug = ? AND zone_number = ? AND question_number = ?"
+      ]
+
+-- | Update the score for an assignment (used to set computed exam scores)
+updateAssignmentScore :: IConnection conn => conn -> T.Text -> T.Text -> Double -> IO ()
+updateAssignmentScore conn netid assignmentSlug scoreValue = do
+  _ <- run conn insertSQL
+    [ toSql netid
+    , toSql assignmentSlug
+    , toSql scoreValue
+    ]
+  return ()
+  where
+    insertSQL = unlines
+      [ "INSERT INTO scores (netid, assignment, score, excused)"
+      , "VALUES (?, ?, ?, FALSE)"
+      , "ON CONFLICT (netid, assignment) DO UPDATE SET"
+      , "  score = EXCLUDED.score"
+      ]

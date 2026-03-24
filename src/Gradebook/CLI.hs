@@ -8,7 +8,7 @@ module Gradebook.CLI
 
 import Options.Applicative
 import qualified Data.Text as T
-import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runMarkCollected)
+import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runMarkCollected, runLoadExam, runLoadExamOverrides)
 
 data Command
   = LoadRoster
@@ -22,6 +22,14 @@ data Command
       }
   | LoadScores
       { scoresFile :: FilePath
+      }
+  | LoadExam
+      { examSlug       :: String
+      , examScoresFile :: FilePath
+      }
+  | LoadExamOverrides
+      { overrideExamSlug :: String
+      , overridesFile    :: FilePath
       }
   | GenerateReport
       { reportNetId :: Maybe String
@@ -75,6 +83,34 @@ loadScoresParser = LoadScores
      <> help "Path to scores CSV file"
       )
 
+-- | Parser for LoadExam command
+loadExamParser :: Parser Command
+loadExamParser = LoadExam
+  <$> strOption
+      ( long "exam"
+     <> short 'e'
+     <> metavar "SLUG"
+     <> help "Exam assignment slug (e.g., exam-1). If this is a retake slug defined in config, scores will be combined with the original."
+      )
+  <*> strArgument
+      ( metavar "FILE"
+     <> help "Path to PrairieLearn instance_questions CSV file"
+      )
+
+-- | Parser for LoadExamOverrides command
+loadExamOverridesParser :: Parser Command
+loadExamOverridesParser = LoadExamOverrides
+  <$> strOption
+      ( long "exam"
+     <> short 'e'
+     <> metavar "SLUG"
+     <> help "Exam assignment slug (e.g., exam-1)"
+      )
+  <*> strArgument
+      ( metavar "FILE"
+     <> help "Path to overrides CSV file (netid,zone_number,question_number,score,max_points,reason)"
+      )
+
 -- | Parser for GenerateReport command
 generateReportParser :: Parser Command
 generateReportParser = GenerateReport
@@ -126,6 +162,14 @@ commandParser = hsubparser
     ( info loadScoresParser
       ( progDesc "Load scores CSV into the database" )
     )
+  <> command "load-exam"
+    ( info loadExamParser
+      ( progDesc "Load exam scores from PrairieLearn CSV (zones and question scores)" )
+    )
+  <> command "load-exam-overrides"
+    ( info loadExamOverridesParser
+      ( progDesc "Apply score overrides to exam questions (takes max of existing and override)" )
+    )
   <> command "report"
     ( info generateReportParser
       ( progDesc "Generate grade report for a student" )
@@ -155,6 +199,8 @@ run cmd = case cmd of
   LoadCategories{categoriesFile = path} -> runLoadCategories path
   LoadAssignments{assignmentsFile = path} -> runLoadAssignments path
   LoadScores{scoresFile = path} -> runLoadScores path
+  LoadExam{examSlug = slug, examScoresFile = path} -> runLoadExam slug path
+  LoadExamOverrides{overrideExamSlug = slug, overridesFile = path} -> runLoadExamOverrides slug path
   GenerateReport{reportNetId = netid, pushToGit = push, reportAll = all'} -> runGenerateReport netid push all'
   MarkCollected{assignmentSlugs = slugs} -> runMarkCollected slugs
   SearchNetId -> runSearchNetId
