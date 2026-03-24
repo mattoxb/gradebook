@@ -1,0 +1,3 @@
+netid,zone_number,question_number,score,max_points,reason
+aakashk5,7,1,10,10,bad lambda calculus variant removed
+aakashk5,2,1,10,10,testing override for tail recursion

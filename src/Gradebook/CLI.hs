@@ -9,6 +9,7 @@ module Gradebook.CLI
 import Options.Applicative
 import qualified Data.Text as T
 import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runMarkCollected, runLoadExam, runLoadExamOverrides)
+import Gradebook.Version (versionString)
 
 data Command
   = LoadRoster
@@ -40,6 +41,7 @@ data Command
       { assignmentSlugs :: [String]
       }
   | SearchNetId
+  | Version
   deriving (Show, Eq)
 
 -- | Parser for LoadRoster command
@@ -143,6 +145,10 @@ markCollectedParser = MarkCollected
 searchNetIdParser :: Parser Command
 searchNetIdParser = pure SearchNetId
 
+-- | Parser for Version command
+versionParser :: Parser Command
+versionParser = pure Version
+
 -- | Command parsers with subcommands
 commandParser :: Parser Command
 commandParser = hsubparser
@@ -182,6 +188,10 @@ commandParser = hsubparser
     ( info searchNetIdParser
       ( progDesc "Search for a student and output their netid" )
     )
+  <> command "version"
+    ( info versionParser
+      ( progDesc "Show version information" )
+    )
   )
 
 -- | Main command parser with program info
@@ -204,3 +214,4 @@ run cmd = case cmd of
   GenerateReport{reportNetId = netid, pushToGit = push, reportAll = all'} -> runGenerateReport netid push all'
   MarkCollected{assignmentSlugs = slugs} -> runMarkCollected slugs
   SearchNetId -> runSearchNetId
+  Version -> putStrLn versionString

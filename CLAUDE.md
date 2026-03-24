@@ -57,6 +57,7 @@ direnv allow
 - `gb report [-n NETID] [-p] [-a]`: Generate grade report
 - `gb collect SLUG...`: Mark assignments as collected
 - `gb netid`: Interactive student search using fzf
+- `gb version`: Show version information
 
 ### Nix Configuration Details
 - GHC version: 9.8.4 (configured in flake.nix via haskell.nix)
@@ -76,6 +77,8 @@ src/Gradebook/
 ├── Assignments.hs   -- CSV assignments parsing
 ├── Scores.hs        -- CSV scores parsing
 ├── ExamScores.hs    -- PrairieLearn exam CSV parsing
+├── ExamOverrides.hs -- Exam score override parsing
+├── Version.hs       -- Version information
 ├── GradeCalculation.hs -- Grade computation logic
 ├── Reports.hs       -- Report formatting and generation
 ├── Commands.hs      -- Command implementations
@@ -162,6 +165,18 @@ student2,7,1,10,10,exam opened before fix was ready
 
 - **fzf**: Required for `gb netid` command (fuzzy search interface)
 - **git**: Required for `gb report -p` (push reports to student repos)
+
+## Version Management
+
+The version is defined in `src/Gradebook/Version.hs`. **Increment the version when adding new features:**
+- **Major** (x.0.0): Breaking changes to commands or config format
+- **Minor** (0.x.0): New commands or features
+- **Patch** (0.0.x): Bug fixes
+
+After making changes, update the installed command with:
+```bash
+nix build && nix profile upgrade gradebook
+```
 
 ## Important Notes
 
