@@ -172,8 +172,8 @@ formatExamSection examGrade _weight =
     -- Format each zone
     zoneLines = concatMap formatZoneSection (egZones examGrade)
 
-    -- Overall exam score
-    overallLine = T.pack $ printf "  Exam Total: %.2f%%" (egPercentage examGrade * 100)
+    -- Overall exam score (right-aligned to match zone lines)
+    overallLine = T.pack $ printf "  %-26s %6.2f%%" ("Exam Total:" :: String) (egPercentage examGrade * 100)
 
   in ["", header, separator] ++ zoneLines ++ ["", overallLine]
 
@@ -181,10 +181,10 @@ formatExamSection examGrade _weight =
 formatZoneSection :: ZoneGrade -> [T.Text]
 formatZoneSection zoneGrade =
   let
-    -- Zone header with overall zone percentage
-    zoneHeader = T.pack $ printf "  %s: %.2f%%"
-                   (T.unpack $ zgZoneTitle zoneGrade)
-                   (zgPercentage zoneGrade * 100)
+    -- Zone header with right-aligned percentage (pad title to 26 chars)
+    title = zgZoneTitle zoneGrade
+    pct = zgPercentage zoneGrade * 100
+    zoneHeader = T.pack $ printf "  %-26s %6.2f%%" (T.unpack title) pct
 
     -- Always show individual question lines
     questionLines = map formatQuestionLine (zgQuestions zoneGrade)
@@ -197,4 +197,4 @@ formatQuestionLine qg =
   let
     qNum = qgQuestionNumber qg
     score = qgCombinedScore qg
-  in T.pack $ printf "    Question %d: %.2f%%" qNum score
+  in T.pack $ printf "    Q %d: %.2f%%" qNum score

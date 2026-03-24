@@ -1,0 +1,20 @@
+exam-1 Breakdown:
+--------------------------------------------------
+  Direct Recursion:           0.00%
+    Q 1: 0.00%
+  Tail Recursion:             0.00%
+    Q 1: 0.00%
+  Tail Recursion Advantage: 100.00%
+    Q 1: 100.00%
+  Algebraic Data Types:       0.00%
+    Q 1: 0.00%
+  Writing HOFs:              50.00%
+    Q 1: 50.00%
+  Using HOFs:                 0.00%
+    Q 1: 0.00%
+  Lambda Calculus:          100.00%
+    Q 1: 100.00%
+  Big Step Semantics:        97.57%
+    Q 1: 97.57%
+
+  Exam Total:                43.45%
