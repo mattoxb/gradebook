@@ -322,40 +322,10 @@ runGenerateReportForOne maybeNetid pushToGit = do
       -- Connect to database
       conn <- openConnection config
 
-      -- Get scores for student
-      scores <- getScoresForStudent conn netid
-
-      -- Get exam configs - use configured exams if available, otherwise auto-detect from DB
-      examConfigs <- if null (exams gradingCfg)
-        then do
-          -- Auto-detect exams from database
-          examSlugs <- getAllExamSlugs conn
-          return [ExamConfig slug slug Nothing MaxScore Nothing Nothing | slug <- examSlugs]
-        else return (exams gradingCfg)
-
-      -- Get exam grades for all exams
-      examGrades <- mapM (buildExamGradeForStudent conn gradingCfg netid) examConfigs
+      -- Generate the report
+      report <- generateStudentReport conn gradingCfg netid
 
       disconnect conn
-
-      -- Calculate grades
-      let categoryGrades = calculateGrades gradingCfg scores
-
-      -- Generate report based on grading mode
-      let baseReport = case gradingMode gradingCfg of
-            Weighted ->
-              generateReport netid categoryGrades
-            PassFail ->
-              let reqResults = evaluateRequirements (passRequirements gradingCfg) categoryGrades
-              in generatePassFailReport netid categoryGrades reqResults
-            LetterGrade ->
-              generateLetterGradeReport netid categoryGrades (gradeThresholds gradingCfg)
-
-      -- Append exam detail sections
-      let examSections = concatMap formatExamGradeIfPresent (zip examConfigs examGrades)
-          report = if null examSections
-                   then baseReport
-                   else baseReport <> "\n" <> T.unlines examSections
 
       -- Output or push report
       if pushToGit
@@ -376,6 +346,44 @@ formatExamGradeIfPresent (_, maybeGrade) =
   case maybeGrade of
     Nothing -> []
     Just grade -> formatExamSection grade 0.20  -- Weight is shown in main category breakdown
+
+-- | Generate a complete report for a student (shared logic for single and bulk reports)
+generateStudentReport :: IConnection conn => conn -> GradingConfig -> T.Text -> IO T.Text
+generateStudentReport conn gradingCfg netid = do
+  -- Get scores for student
+  scores <- getScoresForStudent conn netid
+
+  -- Get exam configs - use configured exams if available, otherwise auto-detect from DB
+  examConfigs <- if null (exams gradingCfg)
+    then do
+      -- Auto-detect exams from database
+      examSlugs <- getAllExamSlugs conn
+      return [ExamConfig slug slug Nothing MaxScore Nothing Nothing | slug <- examSlugs]
+    else return (exams gradingCfg)
+
+  -- Get exam grades for all exams
+  examGrades <- mapM (buildExamGradeForStudent conn gradingCfg netid) examConfigs
+
+  -- Calculate grades
+  let categoryGrades = calculateGrades gradingCfg scores
+
+  -- Generate base report based on grading mode
+  let baseReport = case gradingMode gradingCfg of
+        Weighted ->
+          generateReport netid categoryGrades
+        PassFail ->
+          let reqResults = evaluateRequirements (passRequirements gradingCfg) categoryGrades
+          in generatePassFailReport netid categoryGrades reqResults
+        LetterGrade ->
+          generateLetterGradeReport netid categoryGrades (gradeThresholds gradingCfg)
+
+  -- Append exam detail sections
+  let examSections = concatMap formatExamGradeIfPresent (zip examConfigs examGrades)
+      report = if null examSections
+               then baseReport
+               else baseReport <> "\n" <> T.unlines examSections
+
+  return report
 
 -- | Build ExamGrade for a student from database
 buildExamGradeForStudent :: IConnection conn => conn -> GradingConfig -> T.Text -> ExamConfig -> IO (Maybe ExamGrade)
@@ -520,40 +528,10 @@ generateAndPushForStudent config gradingCfg prefix (netid, studentName, _, _) = 
   -- Connect to database
   conn <- openConnection config
 
-  -- Get scores for student
-  scores <- getScoresForStudent conn netid
-
-  -- Get exam configs - use configured exams if available, otherwise auto-detect from DB
-  examConfigs <- if null (exams gradingCfg)
-    then do
-      -- Auto-detect exams from database
-      examSlugs <- getAllExamSlugs conn
-      return [ExamConfig slug slug Nothing MaxScore Nothing Nothing | slug <- examSlugs]
-    else return (exams gradingCfg)
-
-  -- Get exam grades for all exams
-  examGrades <- mapM (buildExamGradeForStudent conn gradingCfg netid) examConfigs
+  -- Generate the report
+  report <- generateStudentReport conn gradingCfg netid
 
   disconnect conn
-
-  -- Calculate grades
-  let categoryGrades = calculateGrades gradingCfg scores
-
-  -- Generate base report based on grading mode
-  let baseReport = case gradingMode gradingCfg of
-        Weighted ->
-          generateReport netid categoryGrades
-        PassFail ->
-          let reqResults = evaluateRequirements (passRequirements gradingCfg) categoryGrades
-          in generatePassFailReport netid categoryGrades reqResults
-        LetterGrade ->
-          generateLetterGradeReport netid categoryGrades (gradeThresholds gradingCfg)
-
-  -- Append exam detail sections
-  let examSections = concatMap formatExamGradeIfPresent (zip examConfigs examGrades)
-      report = if null examSections
-               then baseReport
-               else baseReport <> "\n" <> T.unlines examSections
 
   -- Push to git
   pushReportToGit (T.unpack netid) prefix report
