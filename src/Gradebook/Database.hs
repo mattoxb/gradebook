@@ -560,10 +560,11 @@ applyExamQuestionOverride conn netid examSlug zoneNum qNum overrideScore overrid
     ]
   return ()
   where
-    -- Use MAX to take the better score; update reason regardless
+    -- Use GREATEST to take the better score; update reason regardless
+    -- GREATEST works in both PostgreSQL and SQLite (3.38+)
     updateSQL = unlines
       [ "UPDATE exam_question_scores"
-      , "SET score = MAX(score, ?),"
+      , "SET score = GREATEST(score, CAST(? AS REAL)),"
       , "    max_points = ?,"
       , "    override_reason = ?"
       , "WHERE netid = ? AND exam_slug = ? AND zone_number = ? AND question_number = ?"
