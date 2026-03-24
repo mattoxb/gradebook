@@ -164,38 +164,30 @@ formatLetterGradeOutcome categoryGrades thresholds =
 -- | Format an exam section for the grade report
 -- Shows each zone with its questions and scores
 formatExamSection :: ExamGrade -> Double -> [T.Text]
-formatExamSection examGrade weight =
+formatExamSection examGrade _weight =
   let
-    header = T.pack $ printf "## %s - Worth %.2f" (T.unpack $ egExamTitle examGrade) (weight * 100)
-    headerLine = ""
-
-    -- Column headers
-    colHeaders = T.pack $ printf "%22s %6s %6s %11s"
-                   ("" :: String) ("Score" :: String) ("Final" :: String) ("New Score" :: String)
-    colUnderline = T.pack $ printf "%22s %6s %6s %11s"
-                   ("" :: String) ("%" :: String) ("%" :: String) ("%" :: String)
+    header = egExamTitle examGrade <> " Breakdown:"
+    separator = T.replicate 50 "-"
 
     -- Format each zone
     zoneLines = concatMap formatZoneSection (egZones examGrade)
 
     -- Overall exam score
-    overallLine = T.pack $ printf "\n%22s %6.2f" ("Exam Total:" :: String) (egPercentage examGrade * 100)
+    overallLine = T.pack $ printf "  Exam Total: %.2f%%" (egPercentage examGrade * 100)
 
-  in [header, headerLine, colHeaders, colUnderline] ++ zoneLines ++ [overallLine]
+  in ["", header, separator] ++ zoneLines ++ ["", overallLine]
 
 -- | Format a zone section within an exam
 formatZoneSection :: ZoneGrade -> [T.Text]
 formatZoneSection zoneGrade =
   let
     -- Zone header with overall zone percentage
-    zoneHeader = T.pack $ printf "%20s: %6.2f"
+    zoneHeader = T.pack $ printf "  %s: %.2f%%"
                    (T.unpack $ zgZoneTitle zoneGrade)
                    (zgPercentage zoneGrade * 100)
 
-    -- If zone has multiple questions, show individual question lines
-    questionLines = if length (zgQuestions zoneGrade) > 1
-      then map formatQuestionLine (zgQuestions zoneGrade)
-      else []
+    -- Always show individual question lines
+    questionLines = map formatQuestionLine (zgQuestions zoneGrade)
 
   in [zoneHeader] ++ questionLines
 
@@ -203,11 +195,6 @@ formatZoneSection zoneGrade =
 formatQuestionLine :: QuestionGrade -> T.Text
 formatQuestionLine qg =
   let
-    qLabel = T.pack $ printf "    Question %d" (qgQuestionNumber qg)
-    origScore :: String
-    origScore = maybe "--" (printf "%6.2f") (qgOriginalScore qg)
-    finalScore' :: String
-    finalScore' = maybe "--" (printf "%6.2f") (qgFinalScore qg)
-    combined :: String
-    combined = printf "%6.2f" (qgCombinedScore qg)
-  in T.pack $ printf "%20s %6s %6s %11s" (T.unpack qLabel) origScore finalScore' combined
+    qNum = qgQuestionNumber qg
+    score = qgCombinedScore qg
+  in T.pack $ printf "    Question %d: %.2f%%" qNum score

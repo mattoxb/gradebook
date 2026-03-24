@@ -35,7 +35,7 @@ import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
 import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), GradingMode(..), ExamConfig(..), RetakePolicy(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, updateAssignmentScore, getExamZonesForExam, applyExamQuestionOverride)
+import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, updateAssignmentScore, getExamZonesForExam, applyExamQuestionOverride, getAllExamSlugs)
 import Gradebook.ExamScores (PrairieLearnRow(..), parsePrairieLearnCSV, extractNetId, groupByStudent, buildExamZones, buildQuestionScores)
 import Gradebook.ExamOverrides (ExamOverride(..), parseExamOverridesCSV)
 import Gradebook.GradeCalculation (calculateExamScore, ExamGrade(..), ZoneGrade(..), QuestionGrade(..))
@@ -325,8 +325,16 @@ runGenerateReportForOne maybeNetid pushToGit = do
       -- Get scores for student
       scores <- getScoresForStudent conn netid
 
-      -- Get exam grades for all configured exams
-      examGrades <- mapM (buildExamGradeForStudent conn gradingCfg netid) (exams gradingCfg)
+      -- Get exam configs - use configured exams if available, otherwise auto-detect from DB
+      examConfigs <- if null (exams gradingCfg)
+        then do
+          -- Auto-detect exams from database
+          examSlugs <- getAllExamSlugs conn
+          return [ExamConfig slug slug Nothing MaxScore Nothing Nothing | slug <- examSlugs]
+        else return (exams gradingCfg)
+
+      -- Get exam grades for all exams
+      examGrades <- mapM (buildExamGradeForStudent conn gradingCfg netid) examConfigs
 
       disconnect conn
 
@@ -344,7 +352,7 @@ runGenerateReportForOne maybeNetid pushToGit = do
               generateLetterGradeReport netid categoryGrades (gradeThresholds gradingCfg)
 
       -- Append exam detail sections
-      let examSections = concatMap formatExamGradeIfPresent (zip (exams gradingCfg) examGrades)
+      let examSections = concatMap formatExamGradeIfPresent (zip examConfigs examGrades)
           report = if null examSections
                    then baseReport
                    else baseReport <> "\n" <> T.unlines examSections

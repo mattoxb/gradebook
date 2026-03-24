@@ -25,6 +25,7 @@ module Gradebook.Database
   , getExamQuestionScoresForStudent
   , updateAssignmentScore
   , applyExamQuestionOverride
+  , getAllExamSlugs
   ) where
 
 import Database.HDBC
@@ -584,3 +585,9 @@ updateAssignmentScore conn netid assignmentSlug scoreValue = do
       , "ON CONFLICT (netid, assignment) DO UPDATE SET"
       , "  score = EXCLUDED.score"
       ]
+
+-- | Get all distinct exam slugs from exam_zones table
+getAllExamSlugs :: IConnection conn => conn -> IO [T.Text]
+getAllExamSlugs conn = do
+  results <- quickQuery' conn "SELECT DISTINCT exam_slug FROM exam_zones ORDER BY exam_slug" []
+  return [fromSql slug | [slug] <- results]
