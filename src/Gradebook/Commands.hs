@@ -981,7 +981,7 @@ runMarkCollected slugStrs = do
 -- | Update assignment collected field in database
 markCollectedInDB :: IConnection conn => conn -> T.Text -> IO ()
 markCollectedInDB conn slug = do
-  _ <- run conn "UPDATE assignments SET collected = 1 WHERE slug = ?" [toSql slug]
+  _ <- run conn "UPDATE assignments SET collected = TRUE WHERE slug = ?" [toSql slug]
   return ()
 
 -- | Update collected field for an assignment if slug matches
