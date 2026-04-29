@@ -34,8 +34,8 @@ import qualified Data.Csv as Csv
 import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
-import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), GradingMode(..), ExamConfig(..), RetakePolicy(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, updateAssignmentScore, getExamZonesForExam, applyExamQuestionOverride, getAllExamSlugs)
+import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), GradingMode(..), CategoryConfig(..), ExamConfig(..), RetakePolicy(..), loadConfig)
+import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, updateAssignmentScore, getExamZonesForExam, applyExamQuestionOverride, getAllExamSlugs, getStudentCreditHours, getStudentName)
 import Gradebook.ExamScores (PrairieLearnRow(..), parsePrairieLearnCSV, extractNetId, groupByStudent, buildExamZones, buildQuestionScores)
 import Gradebook.ExamOverrides (ExamOverride(..), parseExamOverridesCSV)
 import Gradebook.GradeCalculation (calculateExamScore, ExamGrade(..), ZoneGrade(..), QuestionGrade(..))
@@ -44,7 +44,8 @@ import Gradebook.Categories (parseCategoriesCSV)
 import Gradebook.Assignments (parseAssignmentsCSV)
 import Gradebook.Scores (parseScoresCSV)
 import Gradebook.GradeCalculation (calculateGrades, evaluateRequirements)
-import Gradebook.Reports (generateReport, generatePassFailReport, generateLetterGradeReport, formatExamSection)
+import Gradebook.Reports (ReportData(..), generateReport)
+import qualified Data.HashMap.Strict as HM
 
 -- | Open database connection based on config
 -- Returns a ConnWrapper to allow different backend types
@@ -204,16 +205,62 @@ runLoadScores scoresPath = do
       exitFailure
     [] -> return ()
 
-  -- Insert valid scores
-  mapM_ (insertScore conn) validScores
+  -- Diff against existing scores so we can show what actually changed
+  -- and skip writes for unchanged rows.
+  existing <- getAllScores conn
+  let (newScores, updatedScores, unchangedCount) = diffScores existing validScores
+
+  mapM_ (insertScore conn) (newScores ++ updatedScores)
+
+  putStrLn $ "  " ++ show unchangedCount ++ " unchanged, "
+                 ++ show (length updatedScores) ++ " updated, "
+                 ++ show (length newScores) ++ " new"
+
+  -- If the update list is short, list each change so the user can eyeball it.
+  -- Above ~20 it just becomes noise.
+  when (not (null updatedScores) && length updatedScores <= 20) $ do
+    putStrLn "Updated:"
+    mapM_ (printChange existing) updatedScores
 
   -- Commit and close
   commit conn
   disconnect conn
 
-  putStrLn $ "Successfully loaded " ++ show (length validScores) ++ " score entries into database"
+  putStrLn $ "Processed " ++ show (length validScores) ++ " score entries"
   when (not $ null warnings) $
     putStrLn $ "Skipped " ++ show (length warnings) ++ " scores for unknown students"
+  where
+    diffScores existing scores = go [] [] 0 scores
+      where
+        go new upd unch [] = (reverse new, reverse upd, unch)
+        go new upd unch (s:rest) =
+          let key = (scoreNetId s, scoreAssignment s)
+              incoming = (scoreValue s, scoreExcused s)
+          in case M.lookup key existing of
+               Nothing -> go (s:new) upd unch rest
+               Just current
+                 | scoresEq current incoming -> go new upd (unch + 1) rest
+                 | otherwise                 -> go new (s:upd) unch rest
+
+    -- Compare incoming (Double, parsed from CSV) against the stored value
+    -- after rounding through Float, since the scores column is `real`
+    -- (single-precision) in PostgreSQL. Without this, a re-load of the
+    -- same CSV reports every row as updated due to representation drift.
+    scoresEq (Just a, ax) (Just b, bx) =
+      ax == bx && (realToFrac a :: Float) == (realToFrac b :: Float)
+    scoresEq (Nothing, ax) (Nothing, bx) = ax == bx
+    scoresEq _ _ = False
+
+    printChange existing s =
+      let key = (scoreNetId s, scoreAssignment s)
+          oldVal = case M.lookup key existing of
+            Just (Just v, _) -> show v
+            Just (Nothing, _) -> "(none)"
+            Nothing -> "(none)"
+          newVal = maybe "(none)" show (scoreValue s)
+      in putStrLn $ "  " ++ T.unpack (scoreNetId s) ++ " "
+                          ++ T.unpack (scoreAssignment s) ++ ": "
+                          ++ oldVal ++ " -> " ++ newVal
 
 -- | Validate scores against known assignments and students
 -- Returns (valid scores, warnings for missing students, errors for missing assignments)
@@ -340,50 +387,80 @@ runGenerateReportForOne maybeNetid pushToGit = do
           -- Print to console
           TIO.putStrLn report
 
--- | Format exam grade section if student has scores for that exam
-formatExamGradeIfPresent :: (ExamConfig, Maybe ExamGrade) -> [T.Text]
-formatExamGradeIfPresent (_, maybeGrade) =
-  case maybeGrade of
-    Nothing -> []
-    Just grade -> formatExamSection grade 0.20  -- Weight is shown in main category breakdown
+-- | Filter categories by student's credit hours and rescale weights
+filterAndRescaleCategories :: Maybe Int -> GradingConfig -> GradingConfig
+filterAndRescaleCategories Nothing cfg = cfg  -- No credit hours info, use all categories
+filterAndRescaleCategories (Just creditHrs) cfg =
+  let
+    cats = categories cfg
+    -- Filter out categories that don't apply to this student
+    applicableCats = HM.filter (\c -> case categoryCreditHours c of
+        Nothing -> True
+        Just hours -> creditHrs `elem` hours
+      ) cats
+    -- Rescale weights to sum to 1.0
+    totalWeight = sum $ map categoryWeight $ HM.elems applicableCats
+    rescaledCats = if totalWeight > 0
+      then HM.map (\c -> c { categoryWeight = categoryWeight c / totalWeight }) applicableCats
+      else applicableCats
+  in cfg { categories = rescaledCats }
 
 -- | Generate a complete report for a student (shared logic for single and bulk reports)
 generateStudentReport :: IConnection conn => conn -> GradingConfig -> T.Text -> IO T.Text
 generateStudentReport conn gradingCfg netid = do
+  -- Look up student info
+  studentCreditHours <- getStudentCreditHours conn netid
+  studentName <- getStudentName conn netid
+
+  -- Filter categories by credit hours and rescale weights
+  let adjustedCfg = filterAndRescaleCategories studentCreditHours gradingCfg
+
   -- Get scores for student
   scores <- getScoresForStudent conn netid
 
+  -- Filter out scores for categories that don't apply to this student
+  let applicableCatSlugs = HM.keys (categories adjustedCfg)
+      applicableScores = filter (\(_, _, _, _, cat, _, _) -> cat `elem` applicableCatSlugs) scores
+
   -- Get exam configs - use configured exams if available, otherwise auto-detect from DB
-  examConfigs <- if null (exams gradingCfg)
+  examConfigs <- if null (exams adjustedCfg)
     then do
       -- Auto-detect exams from database
       examSlugs <- getAllExamSlugs conn
       return [ExamConfig slug slug Nothing MaxScore Nothing Nothing | slug <- examSlugs]
-    else return (exams gradingCfg)
+    else return (exams adjustedCfg)
 
   -- Get exam grades for all exams
-  examGrades <- mapM (buildExamGradeForStudent conn gradingCfg netid) examConfigs
+  examGradeResults <- mapM (buildExamGradeForStudent conn adjustedCfg netid) examConfigs
+
+  -- Pair exam grades with their per-exam weights
+  let examCategoryWeight = maybe 0 categoryWeight $ HM.lookup "exams" (categories adjustedCfg)
+      numExams = let n = length examConfigs in if n > 0 then n else 1
+      perExamWeight = examCategoryWeight / fromIntegral numExams
+      examGradesWithWeights =
+        [ (grade, perExamWeight)
+        | (_, maybeGrade) <- zip examConfigs examGradeResults
+        , Just grade <- [maybeGrade]
+        ]
 
   -- Calculate grades
-  let categoryGrades = calculateGrades gradingCfg scores
+  let categoryGrades = calculateGrades adjustedCfg applicableScores
 
-  -- Generate base report based on grading mode
-  let baseReport = case gradingMode gradingCfg of
-        Weighted ->
-          generateReport netid categoryGrades
-        PassFail ->
-          let reqResults = evaluateRequirements (passRequirements gradingCfg) categoryGrades
-          in generatePassFailReport netid categoryGrades reqResults
-        LetterGrade ->
-          generateLetterGradeReport netid categoryGrades (gradeThresholds gradingCfg)
+  -- Calculate requirement results (for pass-fail modes)
+  let reqResults = evaluateRequirements (passRequirements adjustedCfg) categoryGrades
 
-  -- Append exam detail sections
-  let examSections = concatMap formatExamGradeIfPresent (zip examConfigs examGrades)
-      report = if null examSections
-               then baseReport
-               else baseReport <> "\n" <> T.unlines examSections
+  -- Build report data and dispatch to the appropriate formatter
+  let reportData = ReportData
+        { rdNetid = netid
+        , rdStudentName = studentName
+        , rdGradingConfig = adjustedCfg
+        , rdCategoryGrades = categoryGrades
+        , rdExamGrades = examGradesWithWeights
+        , rdRequirements = reqResults
+        , rdThresholds = gradeThresholds adjustedCfg
+        }
 
-  return report
+  return $ generateReport reportData
 
 -- | Build ExamGrade for a student from database
 buildExamGradeForStudent :: IConnection conn => conn -> GradingConfig -> T.Text -> ExamConfig -> IO (Maybe ExamGrade)

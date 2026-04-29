@@ -55,7 +55,8 @@ parsePrairieLearnCSV path = do
     Left err -> return $ Left err
     Right (_, rows) ->
       -- Filter to only include students (not staff/instructors)
-      let studentRows = V.toList $ V.filter (\r -> plrRole r == "Student") rows
+      -- and exclude zero-point questions (e.g., PrairieLearn workspace questions)
+      let studentRows = V.toList $ V.filter (\r -> plrRole r == "Student" && plrMaxPoints r > 0) rows
       in return $ Right studentRows
 
 -- | Extract netid from email (e.g., "netid@illinois.edu" -> "netid")

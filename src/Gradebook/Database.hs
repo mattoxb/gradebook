@@ -13,6 +13,7 @@ module Gradebook.Database
   , Score(..)
   , getAssignmentsByCategory
   , getScoresForStudent
+  , getAllScores
   , getAllCategories
   , getAllAssignmentSlugs
   , getAllStudentNetids
@@ -26,10 +27,13 @@ module Gradebook.Database
   , updateAssignmentScore
   , applyExamQuestionOverride
   , getAllExamSlugs
+  , getStudentCreditHours
+  , getStudentName
   ) where
 
 import Database.HDBC
 import qualified Data.Text as T
+import qualified Data.Map.Strict as M
 
 -- | Student record from roster
 data Student = Student
@@ -432,6 +436,39 @@ getScoresForStudent conn netid = do
     sqlValueToBool (SqlString "") = False
     sqlValueToBool _ = True
 
+-- | Get every score in the database, keyed by (netid, assignment).
+-- Used to diff incoming CSV against existing rows so loads can report
+-- unchanged/updated/new counts and skip no-op writes.
+getAllScores :: IConnection conn => conn -> IO (M.Map (T.Text, T.Text) (Maybe Double, Bool))
+getAllScores conn = do
+  results <- quickQuery' conn "SELECT netid, assignment, score, excused FROM scores" []
+  return $ M.fromList $ map rowToEntry results
+  where
+    rowToEntry :: [SqlValue] -> ((T.Text, T.Text), (Maybe Double, Bool))
+    rowToEntry [netid', asn', score', excused'] =
+      ( (fromSql netid', fromSql asn')
+      , ( case score' of
+            SqlNull -> Nothing
+            _       -> Just (fromSql score')
+        , toBool excused'
+        )
+      )
+    rowToEntry _ = error "Unexpected row format from scores query"
+
+    toBool SqlNull            = False
+    toBool (SqlBool b)        = b
+    toBool (SqlInteger 0)     = False
+    toBool (SqlInteger _)     = True
+    toBool (SqlInt32 0)       = False
+    toBool (SqlInt32 _)       = True
+    toBool (SqlInt64 0)       = False
+    toBool (SqlInt64 _)       = True
+    toBool (SqlString "False") = False
+    toBool (SqlString "false") = False
+    toBool (SqlString "0")    = False
+    toBool (SqlString "")     = False
+    toBool _                  = True
+
 -- | Get all category slugs from the database
 getAllCategories :: IConnection conn => conn -> IO [T.Text]
 getAllCategories conn = do
@@ -592,3 +629,27 @@ getAllExamSlugs :: IConnection conn => conn -> IO [T.Text]
 getAllExamSlugs conn = do
   results <- quickQuery' conn "SELECT DISTINCT exam_slug FROM exam_zones ORDER BY exam_slug" []
   return [fromSql slug | [slug] <- results]
+
+-- | Get a student's credit hours from the database
+getStudentCreditHours :: IConnection conn => conn -> T.Text -> IO (Maybe Int)
+getStudentCreditHours conn netid = do
+  results <- quickQuery' conn "SELECT credit FROM students WHERE netid = ?" [toSql netid]
+  case results of
+    [[creditVal]] ->
+      case creditVal of
+        SqlNull -> return Nothing
+        _ -> case reads (fromSql creditVal :: String) of
+               [(n, "")] -> return (Just n)
+               _         -> return Nothing
+    _ -> return Nothing
+
+-- | Get a student's name from the database
+getStudentName :: IConnection conn => conn -> T.Text -> IO (Maybe T.Text)
+getStudentName conn netid = do
+  results <- quickQuery' conn "SELECT name FROM students WHERE netid = ?" [toSql netid]
+  case results of
+    [[nameVal]] ->
+      case nameVal of
+        SqlNull -> return Nothing
+        _ -> return (Just (fromSql nameVal))
+    _ -> return Nothing

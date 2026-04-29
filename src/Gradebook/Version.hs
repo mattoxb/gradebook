@@ -9,7 +9,7 @@ module Gradebook.Version
 --   - Minor: new commands or features
 --   - Patch: bug fixes
 version :: (Int, Int, Int)
-version = (0, 3, 0)
+version = (0, 7, 1)
 
 -- | Version as a display string
 versionString :: String

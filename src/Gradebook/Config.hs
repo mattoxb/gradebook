@@ -46,15 +46,19 @@ instance FromJSON GradingMode where
 
 -- | Category grading configuration (for weighted/letter-grade modes)
 data CategoryConfig = CategoryConfig
-  { categoryWeight    :: Double
-  , categoryDropLowest :: Int
+  { categoryWeight       :: Double
+  , categoryDropLowest   :: Int
+  , categoryCreditHours  :: Maybe [Int]  -- ^ If set, category only applies to students with these credit hours
+  , categoryBonuses      :: HM.HashMap T.Text Double  -- ^ Per-assignment bonus multipliers (e.g. 0.10 = +10%) applied before drop-lowest
   } deriving (Show, Eq, Generic)
 
 instance FromJSON CategoryConfig where
   parseJSON = withObject "CategoryConfig" $ \v -> do
     weight <- v .: "weight"
     dropLowest <- v .:? "drop-lowest" .!= 0
-    return $ CategoryConfig weight dropLowest
+    creditHours <- v .:? "credit-hours"
+    bonuses <- v .:? "bonuses" .!= HM.empty
+    return $ CategoryConfig weight dropLowest creditHours bonuses
 
 -- | Grading policy (e.g., minimum attendance) - legacy, kept for compatibility
 data Policy = Policy
@@ -183,6 +187,7 @@ data GradingConfig = GradingConfig
   , passRequirements  :: [PassRequirement]               -- for pass-fail mode
   , gradeThresholds   :: [GradeThreshold]                -- for letter-grade mode
   , exams             :: [ExamConfig]                    -- exam configurations
+  , reportFormat      :: T.Text                          -- report format identifier (e.g., "default", "cs421-v1", "cs491-v1")
   } deriving (Show, Eq, Generic)
 
 instance FromJSON GradingConfig where
@@ -193,7 +198,8 @@ instance FromJSON GradingConfig where
     reqs <- v .:? "pass-requirements" .!= []
     thresholds <- v .:? "grade-thresholds" .!= []
     examConfigs <- v .:? "exams" .!= []
-    return $ GradingConfig mode cats pols reqs thresholds examConfigs
+    fmt <- v .:? "report-format" .!= "default"
+    return $ GradingConfig mode cats pols reqs thresholds examConfigs fmt
 
 data Config = Config
   { database    :: T.Text

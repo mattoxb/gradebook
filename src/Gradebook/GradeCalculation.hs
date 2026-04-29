@@ -30,10 +30,11 @@ import Gradebook.Config (GradingConfig(..), CategoryConfig(..), PassRequirement(
 data AssignmentGrade = AssignmentGrade
   { agSlug      :: T.Text
   , agTitle     :: T.Text
-  , agScore     :: Maybe Double
+  , agScore     :: Maybe Double  -- ^ Effective score, including any bonus
   , agMaxPoints :: Int
   , agExcused   :: Bool
   , agPending   :: Bool
+  , agBonus     :: Maybe Double  -- ^ Bonus multiplier applied (e.g. 0.10 = +10%), if any
   } deriving (Show, Eq)
 
 -- | Category grade summary
@@ -80,9 +81,11 @@ calculateCategoryGrade categoriesMap (categoryName, assignments) =
     catConfig = HM.lookup categoryName categoriesMap
     weight = maybe 0.0 categoryWeight catConfig
     dropCount = maybe 0 categoryDropLowest catConfig
+    bonusMap = maybe HM.empty categoryBonuses catConfig
 
     -- Convert to AssignmentGrade list, correctly setting pending flag
-    assignmentGrades = map toAssignmentGrade assignments
+    -- and applying any per-assignment bonus before drop-lowest
+    assignmentGrades = map (toAssignmentGrade bonusMap) assignments
 
     -- Separate excused and non-excused
     excusedAssignments = filter agExcused assignmentGrades
@@ -125,17 +128,27 @@ calculateCategoryGrade categoriesMap (categoryName, assignments) =
     -- Create AssignmentGrade with correct pending flag:
     -- pending = True when: not collected AND no score AND not excused
     -- pending = False otherwise (either collected, has score, or is excused)
-    toAssignmentGrade (slug, score, excused, maxPts, title, collected) =
+    -- If a bonus is configured for this slug, multiply the score by (1 + bonus)
+    -- so that the bonused score participates in drop-lowest selection.
+    toAssignmentGrade bonusMap (slug, score, excused, maxPts, title, collected) =
       let isPending = not collected && isNothing score && not excused
-      in AssignmentGrade slug title score maxPts excused isPending
+          mBonus = HM.lookup slug bonusMap
+          bonusedScore = case (score, mBonus) of
+            (Just s, Just b) -> Just (s * (1 + b))
+            _                -> score
+      in AssignmentGrade slug title bonusedScore maxPts excused isPending mBonus
 
 -- | Format a score for display
 formatScore :: AssignmentGrade -> T.Text
 formatScore ag
   | agPending ag = "(pending)"
   | agExcused ag = "(excused)"
-  | Just s <- agScore ag = T.pack $ show s
+  | Just s <- agScore ag = T.pack (show s) <> bonusAnnotation
   | otherwise = "(missing)"
+  where
+    bonusAnnotation = case agBonus ag of
+      Just b | b /= 0 -> T.pack $ " (+" ++ show (b * 100) ++ "% bonus)"
+      _               -> ""
 
 -- | Result of evaluating a single pass requirement
 data RequirementResult = RequirementResult

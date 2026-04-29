@@ -47,6 +47,8 @@ direnv allow
 - **Run**: `./result/bin/gb <command>` or `nix run . -- <command>`
 - **Dev shell**: `nix develop` (provides cabal, HLS, ghc)
 - **In dev shell**: `cabal build`, `cabal run gb -- <command>`
+- **System-wide installation (first time):** `nix profile install gradebook`  Note: this will not replace an existing installation. Use update instead.
+- **System-wide update:** `nix profile upgrade gradebook`
 
 ### Available Commands
 - `gb load-roster [-r FILE]`: Load roster CSV into database
