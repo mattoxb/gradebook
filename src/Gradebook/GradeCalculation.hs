@@ -206,7 +206,7 @@ evaluateRequirement categoryGrades req =
     -- Calculate required count based on rule
     required = case reqRule req of
       PercentageRule pct ->
-        ceiling (pct / 100.0 * fromIntegral effectiveTotal)
+        floor (pct / 100.0 * fromIntegral effectiveTotal)
       PercentageWithCapRule pct cap ->
         min cap (ceiling (pct / 100.0 * fromIntegral effectiveTotal))
       MinimumCountRule cnt ->

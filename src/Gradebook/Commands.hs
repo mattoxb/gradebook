@@ -59,6 +59,9 @@ openConnection config = case dbType config of
   PostgreSQL -> do
     let connStr = "dbname=" ++ T.unpack (database config)
     conn <- connectPostgreSQL connStr
+    -- Suppress NOTICE-level chatter (e.g. "relation already exists, skipping"
+    -- from CREATE TABLE IF NOT EXISTS during initDatabase).
+    _ <- run conn "SET client_min_messages = WARNING" []
     return (ConnWrapper conn)
 
 -- | Load roster CSV into database
@@ -799,7 +802,12 @@ loadExamScoresSimple config examSlugT scoresPath = do
   putStrLn $ "Processing scores for " ++ show studentCount ++ " students..."
 
   -- Process each student
-  processedCount <- foldM (processStudentExamScoresSimple conn studentSet examSlugT) 0 (M.toList byStudent)
+  (processedCount, totals) <- foldM
+    (processStudentExamScoresSimple conn studentSet examSlugT)
+    (0, emptyExamDiffTotals)
+    (M.toList byStudent)
+
+  reportExamDiffTotals totals
 
   -- Commit and close
   commit conn
@@ -808,26 +816,39 @@ loadExamScoresSimple config examSlugT scoresPath = do
   putStrLn $ "Successfully loaded exam scores for " ++ show processedCount ++ " students"
 
 -- | Process exam scores for a single student (simple case, no retake)
-processStudentExamScoresSimple :: IConnection conn => conn -> Set.Set T.Text -> T.Text -> Int -> (T.Text, [PrairieLearnRow]) -> IO Int
-processStudentExamScoresSimple conn studentSet examSlugT count (netid, studentRows) = do
+processStudentExamScoresSimple :: IConnection conn
+                               => conn -> Set.Set T.Text -> T.Text
+                               -> (Int, ExamDiffTotals)
+                               -> (T.Text, [PrairieLearnRow])
+                               -> IO (Int, ExamDiffTotals)
+processStudentExamScoresSimple conn studentSet examSlugT (count, totals) (netid, studentRows) = do
   -- Skip if student not in database
   if not (Set.member netid studentSet)
     then do
       putStrLn $ "Warning: Student '" ++ T.unpack netid ++ "' not found, skipping"
-      return count
+      return (count, totals)
     else do
-      -- Build and insert question scores
+      -- Build incoming question scores from CSV
       let questionScores = buildQuestionScores examSlugT netid studentRows
-      mapM_ (insertExamQuestionScore conn) questionScores
 
-      -- Calculate overall exam score (average of zone averages)
-      let scoreTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- questionScores]
+      -- Diff against existing DB rows: skip overridden questions, only write
+      -- rows that are new or actually changed.
+      existing <- getExamQuestionScoresForStudent conn netid examSlugT
+      let diff = diffExamQuestionScores existing questionScores
+      mapM_ (insertExamQuestionScore conn) (edNew diff ++ edUpdated diff)
+
+      -- Calculate overall exam score using ALL incoming questions (including
+      -- ones we skipped writing because they were overridden — the override
+      -- value is still present in `existing`, but we want the merged effective
+      -- score for this student). Use existing override values where present.
+      let effective = mergeWithOverrides existing questionScores
+          scoreTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- effective]
           examScore = calculateExamScore MaxScore Nothing scoreTuples [] []
 
       -- Update the exam assignment score
       updateAssignmentScore conn netid examSlugT examScore
 
-      return (count + 1)
+      return (count + 1, totals `addExamDiff` diff)
 
 -- | Load exam scores with retake combination
 loadExamScoresWithRetake :: Config -> ExamConfig -> T.Text -> T.Text -> FilePath -> IO ()
@@ -866,7 +887,12 @@ loadExamScoresWithRetake config examCfg retakeSlug primarySlug scoresPath = do
   putStrLn $ "Processing retake scores for " ++ show studentCount ++ " students..."
 
   -- Process each student with retake logic
-  processedCount <- foldM (processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug) 0 (M.toList byStudent)
+  (processedCount, totals) <- foldM
+    (processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug)
+    (0, emptyExamDiffTotals)
+    (M.toList byStudent)
+
+  reportExamDiffTotals totals
 
   -- Commit and close
   commit conn
@@ -875,24 +901,34 @@ loadExamScoresWithRetake config examCfg retakeSlug primarySlug scoresPath = do
   putStrLn $ "Successfully processed retake scores for " ++ show processedCount ++ " students"
 
 -- | Process retake scores for a single student and combine with original
-processStudentRetakeScores :: IConnection conn => conn -> Set.Set T.Text -> ExamConfig -> T.Text -> T.Text -> Int -> (T.Text, [PrairieLearnRow]) -> IO Int
-processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug count (netid, studentRows) = do
+processStudentRetakeScores :: IConnection conn
+                           => conn -> Set.Set T.Text -> ExamConfig -> T.Text -> T.Text
+                           -> (Int, ExamDiffTotals)
+                           -> (T.Text, [PrairieLearnRow])
+                           -> IO (Int, ExamDiffTotals)
+processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug (count, totals) (netid, studentRows) = do
   -- Skip if student not in database
   if not (Set.member netid studentSet)
     then do
       putStrLn $ "Warning: Student '" ++ T.unpack netid ++ "' not found, skipping"
-      return count
+      return (count, totals)
     else do
-      -- Build and insert retake question scores
+      -- Build incoming retake scores
       let retakeScores = buildQuestionScores retakeSlug netid studentRows
-      mapM_ (insertExamQuestionScore conn) retakeScores
 
-      -- Get original exam scores
+      -- Diff against existing retake DB rows: skip overrides, write only changes
+      existingRetake <- getExamQuestionScoresForStudent conn netid retakeSlug
+      let diff = diffExamQuestionScores existingRetake retakeScores
+      mapM_ (insertExamQuestionScore conn) (edNew diff ++ edUpdated diff)
+
+      -- Get original exam scores (already in DB; diff doesn't apply here)
       originalScores <- getExamQuestionScoresForStudent conn netid primarySlug
 
-      -- Convert to the format expected by calculateExamScore
-      let origTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- originalScores]
-          retakeTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- retakeScores]
+      -- Use override-aware merge so a previously-applied override on the
+      -- retake side survives a re-load of the same CSV.
+      let effectiveRetake = mergeWithOverrides existingRetake retakeScores
+          origTuples    = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- originalScores]
+          retakeTuples  = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- effectiveRetake]
 
       -- Calculate combined score using retake policy
       let combinedScore = calculateExamScore
@@ -907,7 +943,110 @@ processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug count 
 
       putStrLn $ "  " ++ T.unpack netid ++ ": combined score = " ++ show (combinedScore * 100) ++ "%"
 
-      return (count + 1)
+      return (count + 1, totals `addExamDiff` diff)
+
+-- | Result of diffing an incoming batch of question scores against the DB
+-- for a single (netid, exam_slug). Override rows are removed from the
+-- incoming batch entirely (counted in edSkippedOverride) and not written.
+data ExamDiff = ExamDiff
+  { edNew              :: [ExamQuestionScore]   -- ^ rows not in DB
+  , edUpdated          :: [ExamQuestionScore]   -- ^ rows whose values changed
+  , edUnchangedCount   :: !Int                  -- ^ rows that match the DB
+  , edSkippedOverride  :: !Int                  -- ^ rows skipped due to override
+  , edChanges          :: [(ExamQuestionScore, Maybe ExamQuestionScore)]
+    -- ^ for reporting: (incoming, prior) — prior is Nothing for new rows
+  }
+
+-- | Aggregate counters across all students in a load.
+data ExamDiffTotals = ExamDiffTotals
+  { tNew              :: !Int
+  , tUpdated          :: !Int
+  , tUnchanged        :: !Int
+  , tSkippedOverride  :: !Int
+  , tChanges          :: [(ExamQuestionScore, Maybe ExamQuestionScore)]
+  }
+
+emptyExamDiffTotals :: ExamDiffTotals
+emptyExamDiffTotals = ExamDiffTotals 0 0 0 0 []
+
+addExamDiff :: ExamDiffTotals -> ExamDiff -> ExamDiffTotals
+addExamDiff t d = ExamDiffTotals
+  { tNew             = tNew t + length (edNew d)
+  , tUpdated         = tUpdated t + length (edUpdated d)
+  , tUnchanged       = tUnchanged t + edUnchangedCount d
+  , tSkippedOverride = tSkippedOverride t + edSkippedOverride d
+  , tChanges         = tChanges t ++ edChanges d
+  }
+
+-- | Diff incoming question scores against existing DB rows.
+diffExamQuestionScores :: [ExamQuestionScore] -> [ExamQuestionScore] -> ExamDiff
+diffExamQuestionScores existing incoming =
+  let existingMap = M.fromList [((eqsZoneNumber s, eqsQuestionNumber s), s) | s <- existing]
+      go new upd unch skp chg [] =
+        ExamDiff (reverse new) (reverse upd) unch skp (reverse chg)
+      go new upd unch skp chg (s:rest) =
+        let key = (eqsZoneNumber s, eqsQuestionNumber s)
+        in case M.lookup key existingMap of
+             Just current
+               | isJust (eqsOverrideReason current) ->
+                   -- Question has a manual override; leave it alone.
+                   go new upd unch (skp + 1) chg rest
+             Just current
+               | examQuestionEq current s ->
+                   go new upd (unch + 1) skp chg rest
+               | otherwise ->
+                   go new (s:upd) unch skp ((s, Just current):chg) rest
+             Nothing ->
+                   go (s:new) upd unch skp ((s, Nothing):chg) rest
+  in go [] [] 0 0 [] incoming
+
+-- | Equality comparison for an exam question score. Score and max_points
+-- round through Float because the columns are REAL (single-precision) in
+-- PostgreSQL — without this, a re-load reports every row as updated.
+examQuestionEq :: ExamQuestionScore -> ExamQuestionScore -> Bool
+examQuestionEq a b =
+     eqsQuestionId a == eqsQuestionId b
+  && (realToFrac (eqsScore a) :: Float)     == (realToFrac (eqsScore b) :: Float)
+  && (realToFrac (eqsMaxPoints a) :: Float) == (realToFrac (eqsMaxPoints b) :: Float)
+
+-- | When recomputing the overall exam score, substitute existing overridden
+-- DB rows for any incoming questions that have an override applied. This
+-- prevents a re-load of the CSV from silently reverting an override's
+-- contribution to the assignment score.
+mergeWithOverrides :: [ExamQuestionScore] -> [ExamQuestionScore] -> [ExamQuestionScore]
+mergeWithOverrides existing incoming =
+  let existingMap = M.fromList [((eqsZoneNumber s, eqsQuestionNumber s), s) | s <- existing]
+  in [ case M.lookup (eqsZoneNumber s, eqsQuestionNumber s) existingMap of
+         Just cur | isJust (eqsOverrideReason cur) -> cur
+         _                                         -> s
+     | s <- incoming
+     ]
+
+-- | Print aggregate diff totals after processing all students. Lists each
+-- change individually if there are 20 or fewer (so a one-off regrade is
+-- easy to eyeball).
+reportExamDiffTotals :: ExamDiffTotals -> IO ()
+reportExamDiffTotals t = do
+  putStrLn $ "  " ++ show (tUnchanged t) ++ " unchanged, "
+                  ++ show (tUpdated t)   ++ " updated, "
+                  ++ show (tNew t)       ++ " new"
+  when (tSkippedOverride t > 0) $
+    putStrLn $ "  " ++ show (tSkippedOverride t)
+                    ++ " skipped (manual override in place)"
+  let changeCount = tNew t + tUpdated t
+  when (changeCount > 0 && changeCount <= 20) $ do
+    putStrLn "Changes:"
+    mapM_ printExamChange (tChanges t)
+  where
+    printExamChange (s, mPrior) =
+      let oldVal = case mPrior of
+            Just p  -> show (eqsScore p) ++ "/" ++ show (eqsMaxPoints p)
+            Nothing -> "(none)"
+          newVal = show (eqsScore s) ++ "/" ++ show (eqsMaxPoints s)
+      in putStrLn $ "  " ++ T.unpack (eqsNetId s)
+                  ++ " z" ++ show (eqsZoneNumber s)
+                  ++ " q" ++ show (eqsQuestionNumber s)
+                  ++ ": " ++ oldVal ++ " -> " ++ newVal
 
 -- | Load exam question score overrides from CSV
 runLoadExamOverrides :: String -> FilePath -> IO ()
