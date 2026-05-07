@@ -131,12 +131,17 @@ formatDropSection :: CategoryGrade -> Int -> [T.Text]
 formatDropSection cg dropCount =
   let
     assignments = cgAssignments cg
-    -- Only consider scored, non-excused assignments for dropping
-    scoredAssignments = filter (\ag -> not (agExcused ag) && not (isNothing (agScore ag))) assignments
+    -- Mirrors calculateCategoryGrade: missings count as zero and are
+    -- eligible to be dropped; pending and excused are not.
+    eligible = filter (\ag -> not (agExcused ag) && not (agPending ag)) assignments
     -- Sort by percentage (ascending) to find lowest
-    sorted = sortOn (\ag -> maybe 0 id (agScore ag) / fromIntegral (agMaxPoints ag)) scoredAssignments
+    sorted = sortOn (\ag -> maybe 0 id (agScore ag) / fromIntegral (agMaxPoints ag)) eligible
     dropped = take dropCount sorted
-    droppedScores = map (\ag -> T.pack $ printf "%.2f" (maybe 0 id (agScore ag))) dropped
+    droppedScores = map (\ag ->
+        if isNothing (agScore ag)
+          then T.pack "(missing)"
+          else T.pack $ printf "%.2f" (maybe 0 id (agScore ag))
+      ) dropped
 
     dropLabel = if dropCount == 1
                 then "Dropping lowest score:"
