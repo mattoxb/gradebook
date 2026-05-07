@@ -91,8 +91,13 @@ calculateCategoryGrade categoriesMap (categoryName, assignments) =
     excusedAssignments = filter agExcused assignmentGrades
     nonExcusedAssignments = filter (not . agExcused) assignmentGrades
 
-    -- Only consider assignments with scores for dropping
-    scoredAssignments = filter (\ag -> not (isNothing (agScore ag))) nonExcusedAssignments
+    -- Eligible for drop/sum: anything that has actually come due. A
+    -- (pending) assignment (not yet collected, no score, not excused)
+    -- shouldn't count against the student. A (missing) assignment
+    -- (collected, no score, not excused) is treated as a zero out of full
+    -- max_points — drop-lowest will naturally pick these first since
+    -- they are the lowest possible. Excused was already filtered above.
+    scoredAssignments = filter (not . agPending) nonExcusedAssignments
 
     -- Calculate earned/possible points based on drop logic
     -- If drops >= number of scores, use the highest score as the average

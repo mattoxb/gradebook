@@ -172,16 +172,26 @@ formatExamGradeSection (examGrade, weight) =
      ++ ["", totalLine]
      ++ [""]
 
--- | Build exam column headers dynamically based on available data
+-- Column widths shared between the exam zone header and zone rows so they
+-- align. "New Score %" is the widest header, so the combined column is
+-- sized to match it.
+zoneTitleWidth, zoneScoreWidth, zoneRetakeWidth, zoneCombinedWidth, zoneFinalWidth :: Int
+zoneTitleWidth    = 24
+zoneScoreWidth    = 7   -- "Score %"
+zoneRetakeWidth   = 6   -- "Retake"
+zoneCombinedWidth = 11  -- "New Score %"
+zoneFinalWidth    = 6   -- "Final"
+
+-- | Build exam column headers dynamically based on available data.
 buildExamColHeaders :: T.Text -> Bool -> Bool -> T.Text
 buildExamColHeaders _examTitle hasRetake hasFinal =
   let
-    baseCols = ["Zone", "Score %"]
-    retakeCols = if hasRetake then ["Retake", "New Score %"] else []
-    -- Note: if there's a final, the "New Score %" column is after that
-    finalCols = if hasFinal then ["Final", "New Score %"] else []
+    baseCols    = [("Zone", zoneTitleWidth), ("Score %", zoneScoreWidth)]
+    retakeCols  = if hasRetake then [("Retake", zoneRetakeWidth), ("New Score %", zoneCombinedWidth)] else []
+    finalCols   = if hasFinal  then [("Final", zoneFinalWidth),   ("New Score %", zoneCombinedWidth)] else []
     allCols = baseCols ++ retakeCols ++ finalCols
-  in T.intercalate "  " $ map (T.justifyRight 16 ' ') allCols
+    fmt (label, w) = T.justifyRight w ' ' label
+  in T.intercalate "  " $ map fmt allCols
 
 -- | Format a zone row in the exam table
 formatZoneRow :: Bool -> Bool -> ZoneGrade -> T.Text
@@ -206,12 +216,13 @@ formatZoneRow hasRetake hasFinal zg =
     -- Combined score is the zone percentage
     combined = pct
 
-    -- Format fields
-    titleCol = T.justifyRight 24 ' ' title
-    origCol = T.pack $ printf "%6.2f" avgOrig
-    retakeCol = if null retakeScores then T.pack $ printf "%6.2f" (0 :: Double) else T.pack $ printf "%6.2f" avgRetake
-    finalCol = if null finalScores then T.pack $ printf "%6.2f" (0 :: Double) else T.pack $ printf "%6.2f" avgFinal
-    combinedCol = T.pack $ printf "%6.2f" combined
+    -- Format fields. Widths match the column-width constants above so
+    -- header and rows line up.
+    titleCol    = T.justifyRight zoneTitleWidth ' ' title
+    origCol     = T.pack $ printf "%*.2f" zoneScoreWidth avgOrig
+    retakeCol   = T.pack $ printf "%*.2f" zoneRetakeWidth (if null retakeScores then 0 else avgRetake)
+    finalCol    = T.pack $ printf "%*.2f" zoneFinalWidth  (if null finalScores  then 0 else avgFinal)
+    combinedCol = T.pack $ printf "%*.2f" zoneCombinedWidth combined
 
     -- Build row
     baseParts = [titleCol, "  ", origCol]

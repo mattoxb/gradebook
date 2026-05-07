@@ -12,3 +12,11 @@ grading:
       title: "Midterm 1"
       retake-slug: exam-1-retake
       retake-policy: max
+    - slug: exam-2
+      title: "Midterm 2"
+      retake-slug: exam-2-retake
+      retake-policy: max
+    - slug: exam-3
+      title: "Midterm 3"
+      retake-slug: exam-3-retake
+      retake-policy: max
