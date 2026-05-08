@@ -149,7 +149,10 @@ formatDropSection cg dropCount =
     droppedLine = "  " <> T.intercalate " " droppedScores <> " "
   in [dropLabel, droppedLine, ""]
 
--- | Format an exam grade section with zone breakdown table
+-- | Format an exam grade section with zone (and per-question) breakdown.
+-- When the exam has retake or final scores anywhere, each zone is followed
+-- by per-question rows so a student can see why combined != avg(orig, retake)
+-- — the combined column is per-question max, not zone-average max.
 formatExamGradeSection :: (ExamGrade, Double) -> [T.Text]
 formatExamGradeSection (examGrade, weight) =
   let
@@ -158,83 +161,102 @@ formatExamGradeSection (examGrade, weight) =
 
     zones = egZones examGrade
 
-    -- Determine which columns to show based on data
     hasRetake = any (any (not . isNothing . qgRetakeScore) . zgQuestions) zones
-    hasFinal = any (any (not . isNothing . qgFinalScore) . zgQuestions) zones
+    hasFinal  = any (any (not . isNothing . qgFinalScore)  . zgQuestions) zones
+    showQuestions = hasRetake || hasFinal
 
-    -- Build column headers
-    colHeaders = buildExamColHeaders (egExamTitle examGrade) hasRetake hasFinal
+    -- Title column width adapts to the longest zone title in this exam.
+    -- Question rows render as "  Qn", so we need at least 4 + width of the
+    -- largest question number; for typical exams with ≤ 9 questions/zone
+    -- that is 4 chars.
+    maxQNum = maximum (1 : [qgQuestionNumber q | z <- zones, q <- zgQuestions z])
+    qLabelWidth = T.length (T.pack ("  Q" ++ show maxQNum))
+    titleWidth = maximum
+      [ T.length "Zone"
+      , qLabelWidth
+      , maximum (0 : [T.length (zgZoneTitle z) | z <- zones])
+      ]
 
-    -- Format each zone row
-    zoneRows = map (formatZoneRow hasRetake hasFinal) zones
+    colHeaders = buildExamColHeaders titleWidth hasRetake hasFinal
+    bodyRows   = concatMap (formatZoneSection titleWidth showQuestions hasRetake hasFinal) zones
 
-    -- Exam total line
     totalLine = T.pack $ printf " - %s Score %%: %.2f%%" (T.unpack $ egExamTitle examGrade) (egPercentage examGrade * 100)
 
   in ["", sectionHeader, ""]
      ++ [colHeaders]
-     ++ zoneRows
+     ++ bodyRows
      ++ ["", totalLine]
      ++ [""]
 
--- Column widths shared between the exam zone header and zone rows so they
--- align. "New Score %" is the widest header, so the combined column is
--- sized to match it.
-zoneTitleWidth, zoneScoreWidth, zoneRetakeWidth, zoneCombinedWidth, zoneFinalWidth :: Int
-zoneTitleWidth    = 24
+-- Numeric column widths chosen so the headers fit without overflowing.
+zoneScoreWidth, zoneRetakeWidth, zoneCombinedWidth, zoneFinalWidth :: Int
 zoneScoreWidth    = 7   -- "Score %"
 zoneRetakeWidth   = 6   -- "Retake"
 zoneCombinedWidth = 11  -- "New Score %"
 zoneFinalWidth    = 6   -- "Final"
 
 -- | Build exam column headers dynamically based on available data.
-buildExamColHeaders :: T.Text -> Bool -> Bool -> T.Text
-buildExamColHeaders _examTitle hasRetake hasFinal =
+buildExamColHeaders :: Int -> Bool -> Bool -> T.Text
+buildExamColHeaders titleWidth hasRetake hasFinal =
   let
-    baseCols    = [("Zone", zoneTitleWidth), ("Score %", zoneScoreWidth)]
+    baseCols    = [("Zone", titleWidth), ("Score %", zoneScoreWidth)]
     retakeCols  = if hasRetake then [("Retake", zoneRetakeWidth), ("New Score %", zoneCombinedWidth)] else []
     finalCols   = if hasFinal  then [("Final", zoneFinalWidth),   ("New Score %", zoneCombinedWidth)] else []
     allCols = baseCols ++ retakeCols ++ finalCols
     fmt (label, w) = T.justifyRight w ' ' label
   in T.intercalate "  " $ map fmt allCols
 
--- | Format a zone row in the exam table
-formatZoneRow :: Bool -> Bool -> ZoneGrade -> T.Text
-formatZoneRow hasRetake hasFinal zg =
+-- | Format a zone: a single summary row when there's no retake/final,
+-- otherwise a zone-summary row followed by one row per question.
+formatZoneSection :: Int -> Bool -> Bool -> Bool -> ZoneGrade -> [T.Text]
+formatZoneSection titleWidth showQuestions hasRetake hasFinal zg =
+  let summary = formatZoneSummaryRow titleWidth hasRetake hasFinal zg
+      qs = if showQuestions
+             then map (formatQuestionRow titleWidth hasRetake hasFinal) (zgQuestions zg)
+             else []
+  in summary : qs
+
+-- | Zone summary row: zone-level averages across the questions in the zone.
+formatZoneSummaryRow :: Int -> Bool -> Bool -> ZoneGrade -> T.Text
+formatZoneSummaryRow titleWidth hasRetake hasFinal zg =
   let
-    title = zgZoneTitle zg
-    pct = zgPercentage zg * 100
     questions = zgQuestions zg
+    origs   = [s | q <- questions, Just s <- [qgOriginalScore q]]
+    retakes = [s | q <- questions, Just s <- [qgRetakeScore q]]
+    finals  = [s | q <- questions, Just s <- [qgFinalScore q]]
+    avg xs = if null xs then 0 else sum xs / fromIntegral (length xs)
 
-    -- Average original score across questions
-    origScores = [s | q <- questions, Just s <- [qgOriginalScore q]]
-    avgOrig = if null origScores then 0 else sum origScores / fromIntegral (length origScores)
+    titleCol    = T.justifyRight titleWidth ' ' (zgZoneTitle zg)
+    origCol     = T.pack $ printf "%*.2f" zoneScoreWidth (avg origs)
+    retakeCol   = T.pack $ printf "%*.2f" zoneRetakeWidth (avg retakes)
+    finalCol    = T.pack $ printf "%*.2f" zoneFinalWidth  (avg finals)
+    combinedCol = T.pack $ printf "%*.2f" zoneCombinedWidth (zgPercentage zg * 100)
 
-    -- Average retake score
-    retakeScores = [s | q <- questions, Just s <- [qgRetakeScore q]]
-    avgRetake = if null retakeScores then 0 else sum retakeScores / fromIntegral (length retakeScores)
-
-    -- Average final score
-    finalScores = [s | q <- questions, Just s <- [qgFinalScore q]]
-    avgFinal = if null finalScores then 0 else sum finalScores / fromIntegral (length finalScores)
-
-    -- Combined score is the zone percentage
-    combined = pct
-
-    -- Format fields. Widths match the column-width constants above so
-    -- header and rows line up.
-    titleCol    = T.justifyRight zoneTitleWidth ' ' title
-    origCol     = T.pack $ printf "%*.2f" zoneScoreWidth avgOrig
-    retakeCol   = T.pack $ printf "%*.2f" zoneRetakeWidth (if null retakeScores then 0 else avgRetake)
-    finalCol    = T.pack $ printf "%*.2f" zoneFinalWidth  (if null finalScores  then 0 else avgFinal)
-    combinedCol = T.pack $ printf "%*.2f" zoneCombinedWidth combined
-
-    -- Build row
-    baseParts = [titleCol, "  ", origCol]
+    baseParts   = [titleCol, "  ", origCol]
     retakeParts = if hasRetake then ["  ", retakeCol, "  ", combinedCol] else []
-    finalParts = if hasFinal then ["  ", finalCol, "  ", combinedCol] else []
-
+    finalParts  = if hasFinal  then ["  ", finalCol,  "  ", combinedCol] else []
   in T.concat $ baseParts ++ retakeParts ++ finalParts
+
+-- | One row per question, indented under its zone. A question that wasn't
+-- attempted on a particular pass shows blanks, not 0.00, in that column.
+formatQuestionRow :: Int -> Bool -> Bool -> QuestionGrade -> T.Text
+formatQuestionRow titleWidth hasRetake hasFinal qg =
+  let
+    label = T.pack ("  Q" ++ show (qgQuestionNumber qg))
+    titleCol    = T.justifyRight titleWidth ' ' label
+    origCol     = formatMaybeScore zoneScoreWidth   (qgOriginalScore qg)
+    retakeCol   = formatMaybeScore zoneRetakeWidth  (qgRetakeScore qg)
+    finalCol    = formatMaybeScore zoneFinalWidth   (qgFinalScore qg)
+    combinedCol = T.pack $ printf "%*.2f" zoneCombinedWidth (qgCombinedScore qg)
+
+    baseParts   = [titleCol, "  ", origCol]
+    retakeParts = if hasRetake then ["  ", retakeCol, "  ", combinedCol] else []
+    finalParts  = if hasFinal  then ["  ", finalCol,  "  ", combinedCol] else []
+  in T.concat $ baseParts ++ retakeParts ++ finalParts
+
+formatMaybeScore :: Int -> Maybe Double -> T.Text
+formatMaybeScore w Nothing  = T.justifyRight w ' ' "-"
+formatMaybeScore w (Just s) = T.pack $ printf "%*.2f" w s
 
 -- | Format a weight value, showing as integer if effectively whole.
 -- Uses a tolerance because renormalized weights (e.g. 0.28 / 0.80 * 100)
