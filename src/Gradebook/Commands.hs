@@ -487,7 +487,7 @@ buildExamGradeForStudent conn gradingCfg netid examCfg = do
         Nothing -> return []
         Just finalSlug -> getExamQuestionScoresForStudent conn netid finalSlug
 
-      if null originalScores
+      if null originalScores && null retakeScores && null finalScores
         then return Nothing
         else do
           -- Build zone grades

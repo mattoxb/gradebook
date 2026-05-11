@@ -224,12 +224,12 @@ formatZoneSummaryRow titleWidth hasRetake hasFinal zg =
     origs   = [s | q <- questions, Just s <- [qgOriginalScore q]]
     retakes = [s | q <- questions, Just s <- [qgRetakeScore q]]
     finals  = [s | q <- questions, Just s <- [qgFinalScore q]]
-    avg xs = if null xs then 0 else sum xs / fromIntegral (length xs)
+    avgMaybe xs = if null xs then Nothing else Just (sum xs / fromIntegral (length xs))
 
     titleCol    = T.justifyRight titleWidth ' ' (zgZoneTitle zg)
-    origCol     = T.pack $ printf "%*.2f" zoneScoreWidth (avg origs)
-    retakeCol   = T.pack $ printf "%*.2f" zoneRetakeWidth (avg retakes)
-    finalCol    = T.pack $ printf "%*.2f" zoneFinalWidth  (avg finals)
+    origCol     = formatMaybeScore zoneScoreWidth   (avgMaybe origs)
+    retakeCol   = formatMaybeScore zoneRetakeWidth  (avgMaybe retakes)
+    finalCol    = formatMaybeScore zoneFinalWidth   (avgMaybe finals)
     combinedCol = T.pack $ printf "%*.2f" zoneCombinedWidth (zgPercentage zg * 100)
 
     baseParts   = [titleCol, "  ", origCol]
