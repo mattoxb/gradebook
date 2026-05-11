@@ -23,4 +23,3 @@ dist-newstyle/
 # Nix
 result
 result-*
-*.lock
