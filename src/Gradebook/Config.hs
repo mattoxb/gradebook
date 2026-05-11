@@ -205,6 +205,7 @@ data Config = Config
   { database    :: T.Text
   , dbType      :: DbType
   , repoPrefix  :: Maybe T.Text
+  , termCode    :: Maybe T.Text
   , grading     :: Maybe GradingConfig
   } deriving (Show, Eq, Generic)
 
@@ -213,8 +214,9 @@ instance FromJSON Config where
     db <- v .: "database"
     dt <- v .: "db-type"
     rp <- v .:? "repo-prefix"
+    tc <- v .:? "term-code"
     gr <- v .:? "grading"
-    return $ Config db dt rp gr
+    return $ Config db dt rp tc gr
 
 -- | Load configuration from config.yaml
 loadConfig :: FilePath -> IO Config

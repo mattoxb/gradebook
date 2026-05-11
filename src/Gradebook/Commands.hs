@@ -9,9 +9,11 @@ module Gradebook.Commands
   , runLoadExam
   , runLoadExamOverrides
   , runGenerateReport
+  , runFinalGrades
   , runMarkCollected
   , runSearchNetId
   , openConnection
+  , buildStudentReportData
   ) where
 
 import Database.HDBC
@@ -35,7 +37,9 @@ import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
 import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), GradingMode(..), CategoryConfig(..), ExamConfig(..), RetakePolicy(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, updateAssignmentScore, getExamZonesForExam, applyExamQuestionOverride, getAllExamSlugs, getStudentCreditHours, getStudentName)
+import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, updateAssignmentScore, getExamZonesForExam, applyExamQuestionOverride, getAllExamSlugs, getStudentCreditHours, getStudentName)
+import Gradebook.FinalGrades (FinalGradeRow(..), buildFinalGradeRow, writeFinalGradesXlsx, lastAttendedDate)
+import System.FilePath (takeDirectory)
 import Gradebook.ExamScores (PrairieLearnRow(..), parsePrairieLearnCSV, extractNetId, groupByStudent, buildExamZones, buildQuestionScores)
 import Gradebook.ExamOverrides (ExamOverride(..), parseExamOverridesCSV)
 import Gradebook.GradeCalculation (calculateExamScore, ExamGrade(..), ZoneGrade(..), QuestionGrade(..))
@@ -346,6 +350,72 @@ runGenerateReport maybeNetid pushToGit generateAll = do
     then runGenerateReportForAll
     else runGenerateReportForOne maybeNetid pushToGit
 
+-- | Write a final-grade .xlsx for every student. Pulls letter grades from
+-- the configured grade-thresholds and the same per-student total used by
+-- the report. F students get a last-attended-date column filled from the
+-- most recent assignment they have a real score for.
+runFinalGrades :: FilePath -> IO ()
+runFinalGrades outPath = do
+  config <- loadConfig "config.yaml"
+
+  let tc = termCode config
+  case tc of
+    Nothing -> do
+      putStrLn "Error: term-code is not set in config.yaml"
+      exitFailure
+    Just term -> do
+      case grading config of
+        Nothing -> do
+          putStrLn "Error: No grading configuration found in config.yaml"
+          exitFailure
+        Just gradingCfg -> do
+          let thresholds = gradeThresholds gradingCfg
+          when (null thresholds) $ do
+            putStrLn "Error: grade-thresholds is empty in config.yaml; cannot assign letter grades"
+            exitFailure
+
+          conn <- openConnection config
+          students <- getAllStudentIdentifiers conn
+          rows <- mapM (buildRowForStudent conn gradingCfg thresholds) students
+          let outRows = [r | Just r <- rows]
+
+          when (null outRows) $ do
+            putStrLn "No students to write."
+            disconnect conn
+            exitFailure
+
+          -- Warn about empty CRNs.
+          let missingCrn = [n | (n, _, c, _) <- students, T.null c]
+          when (not (null missingCrn)) $ do
+            putStrLn $ "Warning: " ++ show (length missingCrn) ++
+                       " student(s) have no CRN: " ++
+                       T.unpack (T.intercalate ", " (take 5 missingCrn)) ++
+                       (if length missingCrn > 5 then ", ..." else "")
+
+          -- Warn about F students with no last-attended date — registrar
+          -- needs that column for failing grades, so flag them for manual
+          -- follow-up.
+          let fMissingDate = [fgrUin r | r <- outRows, fgrLetterGrade r == "F", fgrLastAttended r == Nothing]
+          when (not (null fMissingDate)) $ do
+            putStrLn $ "Warning: " ++ show (length fMissingDate) ++
+                       " F student(s) have no last-attended date " ++
+                       "(no scored assignments). UINs: " ++
+                       T.unpack (T.intercalate ", " fMissingDate)
+
+          -- Ensure output directory exists.
+          let outDir = takeDirectory outPath
+          when (not (null outDir)) $
+            System.Directory.createDirectoryIfMissing True outDir
+
+          writeFinalGradesXlsx outPath term outRows
+          disconnect conn
+          putStrLn $ "Wrote " ++ show (length outRows) ++ " rows to " ++ outPath
+  where
+    buildRowForStudent conn gradingCfg thresholds (netid, studentUin, studentCrn, _name) = do
+      reportData <- buildStudentReportData conn gradingCfg netid
+      lastDate <- lastAttendedDate conn netid
+      return $ buildFinalGradeRow studentUin studentCrn reportData thresholds lastDate
+
 -- | Generate report for a single student
 runGenerateReportForOne :: Maybe String -> Bool -> IO ()
 runGenerateReportForOne maybeNetid pushToGit = do
@@ -411,6 +481,13 @@ filterAndRescaleCategories (Just creditHrs) cfg =
 -- | Generate a complete report for a student (shared logic for single and bulk reports)
 generateStudentReport :: IConnection conn => conn -> GradingConfig -> T.Text -> IO T.Text
 generateStudentReport conn gradingCfg netid = do
+  reportData <- buildStudentReportData conn gradingCfg netid
+  return $ generateReport reportData
+
+-- | Build the ReportData for a student without rendering. Useful for callers
+-- that want the numeric pieces (e.g. final-grade spreadsheet generation).
+buildStudentReportData :: IConnection conn => conn -> GradingConfig -> T.Text -> IO ReportData
+buildStudentReportData conn gradingCfg netid = do
   -- Look up student info
   studentCreditHours <- getStudentCreditHours conn netid
   studentName <- getStudentName conn netid
@@ -452,18 +529,15 @@ generateStudentReport conn gradingCfg netid = do
   -- Calculate requirement results (for pass-fail modes)
   let reqResults = evaluateRequirements (passRequirements adjustedCfg) categoryGrades
 
-  -- Build report data and dispatch to the appropriate formatter
-  let reportData = ReportData
-        { rdNetid = netid
-        , rdStudentName = studentName
-        , rdGradingConfig = adjustedCfg
-        , rdCategoryGrades = categoryGrades
-        , rdExamGrades = examGradesWithWeights
-        , rdRequirements = reqResults
-        , rdThresholds = gradeThresholds adjustedCfg
-        }
-
-  return $ generateReport reportData
+  return ReportData
+    { rdNetid = netid
+    , rdStudentName = studentName
+    , rdGradingConfig = adjustedCfg
+    , rdCategoryGrades = categoryGrades
+    , rdExamGrades = examGradesWithWeights
+    , rdRequirements = reqResults
+    , rdThresholds = gradeThresholds adjustedCfg
+    }
 
 -- | Build ExamGrade for a student from database
 buildExamGradeForStudent :: IConnection conn => conn -> GradingConfig -> T.Text -> ExamConfig -> IO (Maybe ExamGrade)

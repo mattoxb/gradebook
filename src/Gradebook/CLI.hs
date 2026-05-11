@@ -8,7 +8,7 @@ module Gradebook.CLI
 
 import Options.Applicative
 import qualified Data.Text as T
-import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runMarkCollected, runLoadExam, runLoadExamOverrides)
+import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides)
 import Gradebook.Version (versionString)
 
 data Command
@@ -39,6 +39,9 @@ data Command
       }
   | MarkCollected
       { assignmentSlugs :: [String]
+      }
+  | FinalGrades
+      { finalGradesOutPath :: FilePath
       }
   | SearchNetId
   | Version
@@ -141,6 +144,17 @@ markCollectedParser = MarkCollected
      <> help "Assignment slug(s) to mark as collected"
       ))
 
+-- | Parser for FinalGrades command
+finalGradesParser :: Parser Command
+finalGradesParser = FinalGrades
+  <$> strOption
+      ( long "output"
+     <> short 'o'
+     <> metavar "FILE"
+     <> value "output-files/grades.xlsx"
+     <> help "Output spreadsheet path (default: output-files/grades.xlsx)"
+      )
+
 -- | Parser for SearchNetId command
 searchNetIdParser :: Parser Command
 searchNetIdParser = pure SearchNetId
@@ -184,6 +198,10 @@ commandParser = hsubparser
     ( info markCollectedParser
       ( progDesc "Mark assignment(s) as collected (updates DB and CSV)" )
     )
+  <> command "final-grades"
+    ( info finalGradesParser
+      ( progDesc "Write a .xlsx of final letter grades for upload (requires term-code and grade-thresholds in config)" )
+    )
   <> command "netid"
     ( info searchNetIdParser
       ( progDesc "Search for a student and output their netid" )
@@ -213,5 +231,6 @@ run cmd = case cmd of
   LoadExamOverrides{overrideExamSlug = slug, overridesFile = path} -> runLoadExamOverrides slug path
   GenerateReport{reportNetId = netid, pushToGit = push, reportAll = all'} -> runGenerateReport netid push all'
   MarkCollected{assignmentSlugs = slugs} -> runMarkCollected slugs
+  FinalGrades{finalGradesOutPath = path} -> runFinalGrades path
   SearchNetId -> runSearchNetId
   Version -> putStrLn versionString

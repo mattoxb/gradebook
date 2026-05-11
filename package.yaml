@@ -1,5 +1,5 @@
 name:                gradebook
-version:             0.8.2.0
+version:             0.9.0.0
 github:              "mattox/gradebook"
 license:             BSD3
 author:              "Mattox"
@@ -28,6 +28,9 @@ dependencies:
 - filepath >= 1.4
 - unordered-containers >= 0.2  # HashMap for grading config
 - containers >= 0.6            # Set for score validation
+- xlsx >= 1.1                  # Final grade spreadsheet export
+- lens >= 5                    # Required by xlsx for setting fields
+- time >= 1.12                 # Date handling for last-attended-date
 
 library:
   source-dirs: src

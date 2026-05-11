@@ -17,6 +17,7 @@ module Gradebook.Database
   , getAllCategories
   , getAllAssignmentSlugs
   , getAllStudentNetids
+  , getAllStudentIdentifiers
   -- Exam-related exports
   , ExamZone(..)
   , ExamQuestionScore(..)
@@ -486,6 +487,14 @@ getAllStudentNetids :: IConnection conn => conn -> IO [T.Text]
 getAllStudentNetids conn = do
   results <- quickQuery' conn "SELECT netid FROM students" []
   return $ map (\[netid'] -> fromSql netid') results
+
+-- | Get (netid, uin, crn, name) for every student. Used by the final-grade
+-- spreadsheet, which doesn't need the full roster record.
+getAllStudentIdentifiers :: IConnection conn => conn -> IO [(T.Text, T.Text, T.Text, T.Text)]
+getAllStudentIdentifiers conn = do
+  results <- quickQuery' conn
+    "SELECT netid, uin, COALESCE(crn,''), name FROM students ORDER BY netid" []
+  return $ map (\[n, u, c, nm] -> (fromSql n, fromSql u, fromSql c, fromSql nm)) results
 
 -- | Insert an exam zone into the database
 insertExamZone :: IConnection conn => conn -> ExamZone -> IO ()
