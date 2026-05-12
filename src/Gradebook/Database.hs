@@ -25,7 +25,6 @@ module Gradebook.Database
   , insertExamQuestionScore
   , getExamZonesForExam
   , getExamQuestionScoresForStudent
-  , updateAssignmentScore
   , applyExamQuestionOverride
   , getAllExamSlugs
   , getStudentCreditHours
@@ -614,23 +613,6 @@ applyExamQuestionOverride conn netid examSlug zoneNum qNum overrideScore overrid
       , "    max_points = ?,"
       , "    override_reason = ?"
       , "WHERE netid = ? AND exam_slug = ? AND zone_number = ? AND question_number = ?"
-      ]
-
--- | Update the score for an assignment (used to set computed exam scores)
-updateAssignmentScore :: IConnection conn => conn -> T.Text -> T.Text -> Double -> IO ()
-updateAssignmentScore conn netid assignmentSlug scoreValue = do
-  _ <- run conn insertSQL
-    [ toSql netid
-    , toSql assignmentSlug
-    , toSql scoreValue
-    ]
-  return ()
-  where
-    insertSQL = unlines
-      [ "INSERT INTO scores (netid, assignment, score, excused)"
-      , "VALUES (?, ?, ?, FALSE)"
-      , "ON CONFLICT (netid, assignment) DO UPDATE SET"
-      , "  score = EXCLUDED.score"
       ]
 
 -- | Get all distinct exam slugs from exam_zones table

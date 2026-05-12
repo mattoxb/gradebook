@@ -37,12 +37,12 @@ import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
 import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), GradingMode(..), CategoryConfig(..), ExamConfig(..), RetakePolicy(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, updateAssignmentScore, getExamZonesForExam, applyExamQuestionOverride, getAllExamSlugs, getStudentCreditHours, getStudentName)
+import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, getAllExamSlugs, getStudentCreditHours, getStudentName)
 import Gradebook.FinalGrades (FinalGradeRow(..), buildFinalGradeRow, writeFinalGradesXlsx, lastAttendedDate)
 import System.FilePath (takeDirectory)
 import Gradebook.ExamScores (PrairieLearnRow(..), parsePrairieLearnCSV, extractNetId, groupByStudent, buildExamZones, buildQuestionScores)
 import Gradebook.ExamOverrides (ExamOverride(..), parseExamOverridesCSV)
-import Gradebook.GradeCalculation (calculateExamScore, ExamGrade(..), ZoneGrade(..), QuestionGrade(..))
+import Gradebook.GradeCalculation (calculateExamScore, ExamGrade(..), ZoneGrade(..), QuestionGrade(..), CategoryGrade(..))
 import Gradebook.Roster (parseRosterCSV)
 import Gradebook.Categories (parseCategoriesCSV)
 import Gradebook.Assignments (parseAssignmentsCSV)
@@ -498,9 +498,14 @@ buildStudentReportData conn gradingCfg netid = do
   -- Get scores for student
   scores <- getScoresForStudent conn netid
 
-  -- Filter out scores for categories that don't apply to this student
+  -- Filter out scores for categories that don't apply to this student.
+  -- Also drop anything in the "exams" category: exam totals are derived
+  -- at report time from exam_question_scores (via buildExamGradeForStudent),
+  -- so any stale rows in `scores` under exam slugs must not double-count.
   let applicableCatSlugs = HM.keys (categories adjustedCfg)
-      applicableScores = filter (\(_, _, _, _, cat, _, _) -> cat `elem` applicableCatSlugs) scores
+      applicableScores =
+        filter (\(_, _, _, _, cat, _, _) -> cat `elem` applicableCatSlugs && cat /= "exams")
+               scores
 
   -- Get exam configs - use configured exams if available, otherwise auto-detect from DB
   examConfigs <- if null (exams adjustedCfg)
@@ -523,8 +528,26 @@ buildStudentReportData conn gradingCfg netid = do
         , Just grade <- [maybeGrade]
         ]
 
-  -- Calculate grades
-  let categoryGrades = calculateGrades adjustedCfg applicableScores
+  -- Calculate grades for non-exam categories from the scores table.
+  let nonExamCategoryGrades = calculateGrades adjustedCfg applicableScores
+
+  -- Synthesize the exams CategoryGrade from the live per-exam computations
+  -- so the report's total-summation (which folds cgWeightedScore across
+  -- all CategoryGrades) picks up exams without reading scores.exam-*.
+  let examsContribution = sum [egPercentage g * w | (g, w) <- examGradesWithWeights]
+      examsCategoryGrade = CategoryGrade
+        { cgCategory       = "exams"
+        , cgAssignments    = []
+        , cgEarnedPoints   = 0
+        , cgPossiblePoints = 0
+        , cgPercentage     = if null examGradesWithWeights
+                             then Nothing
+                             else Just (examsContribution / max 1e-9 examCategoryWeight)
+        , cgWeightedScore  = if null examGradesWithWeights
+                             then Nothing
+                             else Just examsContribution
+        }
+      categoryGrades = examsCategoryGrade : nonExamCategoryGrades
 
   -- Calculate requirement results (for pass-fail modes)
   let reqResults = evaluateRequirements (passRequirements adjustedCfg) categoryGrades
@@ -906,21 +929,12 @@ processStudentExamScoresSimple conn studentSet examSlugT (count, totals) (netid,
       let questionScores = buildQuestionScores examSlugT netid studentRows
 
       -- Diff against existing DB rows: skip overridden questions, only write
-      -- rows that are new or actually changed.
+      -- rows that are new or actually changed. Overall exam scores are
+      -- computed at report time from exam_question_scores, so this path
+      -- intentionally does NOT write to the `scores` table.
       existing <- getExamQuestionScoresForStudent conn netid examSlugT
       let diff = diffExamQuestionScores existing questionScores
       mapM_ (insertExamQuestionScore conn) (edNew diff ++ edUpdated diff)
-
-      -- Calculate overall exam score using ALL incoming questions (including
-      -- ones we skipped writing because they were overridden — the override
-      -- value is still present in `existing`, but we want the merged effective
-      -- score for this student). Use existing override values where present.
-      let effective = mergeWithOverrides existing questionScores
-          scoreTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- effective]
-          examScore = calculateExamScore MaxScore Nothing scoreTuples [] []
-
-      -- Update the exam assignment score
-      updateAssignmentScore conn netid examSlugT examScore
 
       return (count + 1, totals `addExamDiff` diff)
 
@@ -995,25 +1009,19 @@ processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug (count
       let diff = diffExamQuestionScores existingRetake retakeScores
       mapM_ (insertExamQuestionScore conn) (edNew diff ++ edUpdated diff)
 
-      -- Get original exam scores (already in DB; diff doesn't apply here)
+      -- Compute combined score for the log line only — overall exam scores
+      -- are derived at report time, so we intentionally do NOT write to
+      -- the `scores` table here.
       originalScores <- getExamQuestionScoresForStudent conn netid primarySlug
-
-      -- Use override-aware merge so a previously-applied override on the
-      -- retake side survives a re-load of the same CSV.
       let effectiveRetake = mergeWithOverrides existingRetake retakeScores
           origTuples    = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- originalScores]
           retakeTuples  = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- effectiveRetake]
-
-      -- Calculate combined score using retake policy
-      let combinedScore = calculateExamScore
+          combinedScore = calculateExamScore
             (examRetakePolicy examCfg)
-            Nothing  -- No final policy for now
+            Nothing
             origTuples
             retakeTuples
-            []  -- No final scores
-
-      -- Update the primary exam assignment score
-      updateAssignmentScore conn netid primarySlug combinedScore
+            []
 
       putStrLn $ "  " ++ T.unpack netid ++ ": combined score = " ++ show (combinedScore * 100) ++ "%"
 
@@ -1152,19 +1160,10 @@ runLoadExamOverrides examSlugStr overridesPath = do
   validStudents <- getAllStudentNetids conn
   let studentSet = Set.fromList validStudents
 
-  -- Apply each override
+  -- Apply each override. Question-level scores are updated; overall exam
+  -- scores are derived from exam_question_scores at report time, so no
+  -- recomputation step or `scores` table writeback is needed here.
   appliedCount <- foldM (applyOverride conn studentSet examSlugT) 0 overrides
-
-  -- Now recalculate exam scores for affected students
-  let affectedNetids = Set.fromList [eoNetId o | o <- overrides, Set.member (eoNetId o) studentSet]
-  putStrLn $ "Recalculating exam scores for " ++ show (Set.size affectedNetids) ++ " affected students..."
-
-  -- Get exam config for retake policy
-  case grading config of
-    Nothing -> putStrLn "Warning: No grading config, using simple score calculation"
-    Just gradingCfg -> do
-      let examCfg = find (\c -> examSlug c == examSlugT) (exams gradingCfg)
-      mapM_ (recalculateStudentExamScore conn examSlugT examCfg) (Set.toList affectedNetids)
 
   -- Commit and close
   commit conn
@@ -1194,30 +1193,6 @@ applyOverride conn studentSet examSlugT count override = do
                  " question " ++ show (eoQuestionNumber override) ++
                  ": " ++ T.unpack (eoReason override)
       return (count + 1)
-
--- | Recalculate a student's exam score after overrides
-recalculateStudentExamScore :: IConnection conn => conn -> T.Text -> Maybe ExamConfig -> T.Text -> IO ()
-recalculateStudentExamScore conn examSlugT maybeExamCfg netid = do
-  -- Get all question scores for this student on this exam
-  questionScores <- getExamQuestionScoresForStudent conn netid examSlugT
-
-  if null questionScores
-    then putStrLn $ "  Warning: No scores found for " ++ T.unpack netid
-    else do
-      -- Get retake scores if configured
-      retakeScores <- case maybeExamCfg >>= examRetakeSlug of
-        Nothing -> return []
-        Just retakeSlug -> getExamQuestionScoresForStudent conn netid retakeSlug
-
-      -- Calculate combined score
-      let scoreTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- questionScores]
-          retakeTuples = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- retakeScores]
-          retakePolicy = maybe MaxScore examRetakePolicy maybeExamCfg
-          newScore = calculateExamScore retakePolicy Nothing scoreTuples retakeTuples []
-
-      -- Update the exam score
-      updateAssignmentScore conn netid examSlugT newScore
-      putStrLn $ "  " ++ T.unpack netid ++ ": new score = " ++ show (newScore * 100) ++ "%"
 
 -- | Mark assignments as collected (updates both DB and CSV)
 runMarkCollected :: [String] -> IO ()
