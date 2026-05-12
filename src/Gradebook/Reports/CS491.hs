@@ -47,8 +47,11 @@ formatCategorySection cg =
 
     formattedAssignments = map (formatAssignmentStatus maxTitleWidth) assignments
 
-    -- Summary: completed/total
-    completed = length $ filter isCompleted assignments
+    -- Summary: completed/total. Sum of scores rather than count of rows so
+    -- a multi-credit extra-credit row (e.g. IPL with score 5) contributes
+    -- the same way it does to the pass requirement.
+    completed :: Int
+    completed = floor (sum [maybe 0 id (agScore a) | a <- assignments, isCompleted a])
     excused = length $ filter agExcused assignments
     total = length assignments - excused
     summaryLine = T.pack $ printf "  %d/%d completed" completed total
@@ -80,7 +83,13 @@ assignmentStatus :: AssignmentGrade -> T.Text
 assignmentStatus ag
   | agExcused ag = "[excused]"
   | agPending ag = "[pending]"
-  | isCompleted ag = "✅"
+  | isCompleted ag =
+      let mult = case agScore ag of
+            Just s | s > 1 -> Just (floor s :: Int)
+            _              -> Nothing
+      in case mult of
+           Just n  -> T.pack (printf "✅ (×%d)" n)
+           Nothing -> "✅"
   | otherwise = ""
 
 -- | Check if an assignment is completed (has a score > 0)

@@ -196,11 +196,14 @@ evaluateRequirement categoryGrades req =
 
     -- Count scores: we consider an assignment "achieved" if it has a score > 0
     -- For pass-fail courses like cs491cap, any score means they solved it
+    -- For pass-fail courses each non-zero score counts as one solve, but
+    -- an assignment with score > 1 (e.g. multi-credit extra credit like
+    -- IPL=5) counts as that many solves. Existing 0/1 data is unaffected.
     (achieved, excused, total) = case maybeCatGrade of
       Nothing -> (0, 0, 0)
       Just cg ->
         let assignments = cgAssignments cg
-            achievedCount = length $ filter hasScore assignments
+            achievedCount = floor (sum [maybe 0 id (agScore a) | a <- assignments, hasScore a])
             excusedCount = length $ filter agExcused assignments
             totalCount = length assignments
         in (achievedCount, excusedCount, totalCount)
