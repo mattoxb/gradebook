@@ -294,8 +294,10 @@ calculateExamScore retakePolicy finalPolicy originalScores retakeScores finalSco
     retakeMap = toPercentMap retakeScores
     finalMap = toPercentMap finalScores
 
-    -- Get all unique (zone, question) keys from original
-    allKeys = M.keys origMap
+    -- All (zone, question) keys seen across any attempt. Using only the
+    -- original map silently zeros out students who skipped the original
+    -- and only took the retake or final.
+    allKeys = M.keys (M.unions [origMap, retakeMap, finalMap])
 
     -- Combine original and retake for each question
     afterRetake = M.fromList
