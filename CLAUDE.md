@@ -56,10 +56,18 @@ direnv allow
 - `gb load-assignments [-a FILE]`: Load assignments
 - `gb load-scores FILE`: Load student scores from CSV
 - `gb load-exam -e SLUG FILE`: Load exam scores from PrairieLearn CSV
+- `gb load-exam-overrides -e SLUG FILE`: Apply per-question score overrides
 - `gb report [-n NETID] [-p] [-a]`: Generate grade report
+- `gb final-grades [-o FILE]`: Write registrar upload spreadsheet (.xlsx) — needs `term-code` and `grade-thresholds` in config
 - `gb collect SLUG...`: Mark assignments as collected
 - `gb netid`: Interactive student search using fzf
 - `gb version`: Show version information
+
+### Load Command Invariants
+
+All `gb load-*` commands MUST be idempotent: re-running a load with the same input is a no-op, and re-running with updated input converges to the new state without leaving stale rows behind. This was learned the hard way after a non-idempotent retake-loading bug silently lowered exam totals across the cohort.
+
+Loading order matters when both base data and overrides are present: load the primary exam → retake → overrides. Overrides go last because they edit per-question rows in-place and don't re-derive themselves from CSV on a subsequent load; running an earlier load step after overrides could wipe those edits.
 
 ### Nix Configuration Details
 - GHC version: 9.8.4 (configured in flake.nix via haskell.nix)
@@ -100,6 +108,10 @@ app/
 
 - **Exam Support** (ExamScores.hs, Commands.hs): Parses PrairieLearn `instance_questions` CSV exports, stores individual question scores per zone, supports retake policies (max, max-if-better-avg-if-worse).
 
+- **Exam totals are computed at report time, not stored.** `exam_question_scores` is the single source of truth for exam data. `gb report` (via `buildExamGradeForStudent`) reads those per-question rows and computes per-zone-then-per-exam averages on the fly; the exams contribution to the total is synthesized from that live computation. There are NO `scores.exam-*` rows. Do not add writeback of computed exam totals to the `scores` table — that path was removed in v0.11.0 after repeated bugs caused stale rows to silently lower student totals.
+
+- **Multi-credit / extra-credit assignments.** In pass-fail courses, a single assignment row with a score > 1 contributes its full score (floor) to the requirement counter and the per-category "N/M completed" summary, instead of always counting as 1. Used in CS 491 to give 5 solves of extra credit for IPL via one `ipl` assignment row with score=5 in `score-files/ipl.csv`. Reports annotate such rows with `(×N)` after the checkmark. No schema change is needed; just put the multi-credit count in the score column.
+
 - **Reports** (Reports.hs): Generates formatted grade reports including exam zone breakdowns.
 
 ### Database Schema
@@ -120,9 +132,15 @@ app/
 database: cs421-grades-sp26.db
 db-type: sqlite3  # or postgresql
 repo-prefix: "https://github.com/org/prefix_"
+term-code: "120261"  # required by `gb final-grades`; UIUC Banner term code
 
 grading:
   mode: weighted  # or pass-fail, letter-grade
+  grade-thresholds:  # required by `gb final-grades`; also drives the letter grade line in reports
+    - {grade: "A+", min-percent: 97}
+    - {grade: "A",  min-percent: 93}
+    # ... through F
+    - {grade: "F",  min-percent: 0}
   categories:
     exams:
       weight: 0.20
@@ -179,6 +197,10 @@ After making changes, update the installed command with:
 ```bash
 nix build && nix profile upgrade gradebook
 ```
+
+## TODOs
+
+- **Report markdown rendering (do before Summer 2026 course starts):** `gb report` output is technically markdown but uses space-padded columns for alignment, which collapses ugly in GitHub/Obsidian/etc. Switch the table-ish sections to real GFM tables. Covers both `Reports/CS421.hs` and `Reports/CS491.hs`; exam zone breakdown (nested Q rows, dynamic column widths) is the trickiest case.
 
 ## Important Notes
 
