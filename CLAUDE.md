@@ -55,8 +55,10 @@ direnv allow
 - `gb load-categories [-c FILE]`: Load grade categories
 - `gb load-assignments [-a FILE]`: Load assignments
 - `gb load-scores FILE`: Load student scores from CSV
-- `gb load-exam -e SLUG FILE`: Load exam scores from PrairieLearn CSV
-- `gb load-exam-overrides -e SLUG FILE`: Apply per-question score overrides
+- `gb gen-exam-zones -e SLUG INFO_JSON [-o FILE] [--force]`: Generate `data-files/<slug>-zones.csv` from a PrairieLearn `infoAssessment.json` (refuses to overwrite without `--force`)
+- `gb load-exam-zones -e SLUG FILE`: Load zone/question structure from a zones CSV (run before `load-exam`)
+- `gb load-exam -e SLUG FILE`: Load exam scores from PrairieLearn CSV — hard-fails if a question_id is missing from `exam_questions`
+- `gb load-exam-overrides -e SLUG FILE`: Apply per-question score overrides keyed on `question_id`; hard-fails if target row missing
 - `gb report [-n NETID] [-p] [-a]`: Generate grade report
 - `gb final-grades [-o FILE]`: Write registrar upload spreadsheet (.xlsx) — needs `term-code` and `grade-thresholds` in config
 - `gb collect SLUG...`: Mark assignments as collected
@@ -67,7 +69,9 @@ direnv allow
 
 All `gb load-*` commands MUST be idempotent: re-running a load with the same input is a no-op, and re-running with updated input converges to the new state without leaving stale rows behind. This was learned the hard way after a non-idempotent retake-loading bug silently lowered exam totals across the cohort.
 
-Loading order matters when both base data and overrides are present: load the primary exam → retake → overrides. Overrides go last because they edit per-question rows in-place and don't re-derive themselves from CSV on a subsequent load; running an earlier load step after overrides could wipe those edits.
+Loading order matters: `load-exam-zones` (populates `exam_questions`) → `load-exam` (primary) → `load-exam` (retake) → `load-exam-overrides`. `load-exam` hard-fails if it sees a question_id not in `exam_questions`. Overrides go last because they edit per-question rows in-place and don't re-derive themselves from CSV on a subsequent load; running an earlier load step after overrides could wipe those edits.
+
+The zones CSV is hand-editable and authoritative — not the JSON. PrairieLearn's `infoAssessment.json` describes the *live* exam, but the gradebook needs to track historical question_ids too (e.g. a question removed mid-exam still has DB rows). `gb gen-exam-zones` seeds the CSV from JSON but refuses to overwrite; add removed-mid-exam alternatives by hand with a `comment`.
 
 ### Nix Configuration Details
 - GHC version: 9.8.4 (configured in flake.nix via haskell.nix)
@@ -86,8 +90,10 @@ src/Gradebook/
 ├── Categories.hs    -- CSV categories parsing
 ├── Assignments.hs   -- CSV assignments parsing
 ├── Scores.hs        -- CSV scores parsing
-├── ExamScores.hs    -- PrairieLearn exam CSV parsing
-├── ExamOverrides.hs -- Exam score override parsing
+├── ExamScores.hs    -- PrairieLearn exam CSV parsing (uses exam_questions for question_number lookup)
+├── ExamOverrides.hs -- Exam score override parsing (CSV keyed on question_id)
+├── ExamZonesCSV.hs  -- Read/write data-files/<slug>-zones.csv
+├── InfoAssessment.hs -- PrairieLearn infoAssessment.json parser (used by gen-exam-zones)
 ├── Version.hs       -- Version information
 ├── GradeCalculation.hs -- Grade computation logic
 ├── Reports.hs       -- Report formatting and generation
@@ -100,7 +106,7 @@ app/
 
 ### Key Components
 
-- **Database Layer** (Database.hs): Uses HDBC for database abstraction, supporting both SQLite3 and PostgreSQL. Tables: `students`, `categories`, `assignments`, `scores`, `exam_zones`, `exam_question_scores`.
+- **Database Layer** (Database.hs): Uses HDBC for database abstraction, supporting both SQLite3 and PostgreSQL. Tables: `students`, `categories`, `assignments`, `scores`, `exam_zones`, `exam_questions`, `exam_question_scores`.
 
 - **Configuration** (Config.hs): Reads `config.yaml` for database settings, grading configuration (weighted/pass-fail/letter-grade modes), category weights, and exam configurations.
 
@@ -124,7 +130,8 @@ app/
 
 **Exam Tables:**
 - `exam_zones`: Exam structure (exam_slug FK, zone_number, zone_title, question_count)
-- `exam_question_scores`: Individual question scores (netid FK, exam_slug, zone_number, question_number, question_id, score, max_points)
+- `exam_questions`: Question slot mapping (exam_slug, zone_number, question_number, question_id). One row per PrairieLearn alternative; multiple alternatives for the same slot share a `question_number`. Loaded from `data-files/<slug>-zones.csv` by `load-exam-zones`.
+- `exam_question_scores`: Individual question scores (netid FK, exam_slug, zone_number, question_number, question_id, score, max_points, override_reason). `question_number` is derived from `exam_questions` at load time — *not* by alphabetical sort of question_id (that bug silently misaligned overrides for months).
 
 ### Configuration Example
 
@@ -159,27 +166,27 @@ grading:
 
 ### Exam Loading Workflow
 
-1. Load the primary exam: `gb load-exam -e exam-1 midterm1_instance_questions.csv`
-2. Load retake (if any): `gb load-exam -e exam-1-retake midterm1_retake_instance_questions.csv`
-   - Automatically detects retake from config and combines scores
-3. Apply overrides (if needed): `gb load-exam-overrides -e exam-1 overrides.csv`
-   - Takes max of existing score and override (won't lower scores)
-   - Recalculates overall exam score after applying overrides
-4. Generate report: `gb report -n netid` shows zone-by-zone breakdown
+1. (First time per exam, or after a JSON change) generate the zones CSV: `gb gen-exam-zones -e exam-1 path/to/midterm1/infoAssessment.json`. Hand-edit `data-files/exam-1-zones.csv` to add any alternatives that exist in DB but not in the live JSON (e.g., questions removed mid-exam), giving them a `comment`.
+2. Load the zone/question structure: `gb load-exam-zones -e exam-1 data-files/exam-1-zones.csv`. Must precede `load-exam`.
+3. Load the primary exam: `gb load-exam -e exam-1 midterm1_instance_questions.csv`. Hard-fails if the CSV references an unknown question_id (remediation: add it to the zones CSV and re-run `load-exam-zones`).
+4. Load retake (if any): `gb load-exam -e exam-1-retake midterm1_retake_instance_questions.csv`. Automatically detects retake from config.
+5. Apply overrides (if needed): `gb load-exam-overrides -e exam-1 overrides.csv`. Takes max of existing and override; hard-fails if the target (netid, exam, question_id) row doesn't exist.
+6. Generate report: `gb report -n netid` shows zone + per-question breakdown.
 
 ### Exam Override CSV Format
 
 For correcting bad questions or giving makeup credit:
 
 ```csv
-netid,zone_number,question_number,score,max_points,reason
-student1,7,1,10,10,bad lambda calculus variant
-student2,7,1,10,10,exam opened before fix was ready
+netid,question_id,score,max_points,reason
+student1,lambda-calculus/evaluation/midterm1,10,10,bad lambda calculus variant
+student2,short-answer/cps-vs-tail-exam,10,10,LLM-graded retake
 ```
 
-- Override takes the **max** of existing and override score (won't lower a score)
-- `reason` is stored in database for audit trail
-- Can query overrides later: `SELECT * FROM exam_question_scores WHERE override_reason IS NOT NULL`
+- Keyed on `question_id` (the PrairieLearn slug) — stable across JSON reorderings; alphabetical-vs-JSON divergence used to silently misapply overrides.
+- Override takes the **max** of existing and override score (won't lower a score).
+- `reason` is stored in `exam_question_scores.override_reason` for audit trail.
+- Can query overrides later: `SELECT * FROM exam_question_scores WHERE override_reason IS NOT NULL`.
 
 ### External Dependencies
 
