@@ -163,7 +163,11 @@ formatExamGradeSection (examGrade, weight) =
 
     hasRetake = any (any (not . isNothing . qgRetakeScore) . zgQuestions) zones
     hasFinal  = any (any (not . isNothing . qgFinalScore)  . zgQuestions) zones
-    showQuestions = hasRetake || hasFinal
+    -- Always render per-question rows. Students use these to decide which
+    -- questions to redo on a retake, and hand-graded scores live at the
+    -- question level. The retake/final *columns* still gate on the booleans
+    -- above; we only fan questions out when needed.
+    showQuestions = True
 
     -- Title column width adapts to the longest zone title in this exam.
     -- Question rows render as "  Qn", so we need at least 4 + width of the
