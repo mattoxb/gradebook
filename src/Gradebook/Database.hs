@@ -26,6 +26,10 @@ module Gradebook.Database
   , getExamZonesForExam
   , getExamQuestionScoresForStudent
   , applyExamQuestionOverride
+  , applyExamQuestionOverrideById
+  , insertExamQuestion
+  , getExamQuestionMap
+  , deleteExamQuestionsForExam
   , getAllExamSlugs
   , getStudentCreditHours
   , getStudentName
@@ -113,6 +117,7 @@ initDatabase conn = do
   _ <- run conn createAssignmentsTableSQL []
   _ <- run conn createScoresTableSQL []
   _ <- run conn createExamZonesTableSQL []
+  _ <- run conn createExamQuestionsTableSQL []
   _ <- run conn createExamQuestionScoresTableSQL []
   commit conn
   where
@@ -183,6 +188,20 @@ initDatabase conn = do
       , "  question_count INTEGER NOT NULL DEFAULT 1,"
       , "  PRIMARY KEY (exam_slug, zone_number),"
       , "  FOREIGN KEY (exam_slug) REFERENCES assignments(slug) ON DELETE CASCADE"
+      , ")"
+      ]
+
+    -- Question slot mapping per exam (derived from PrairieLearn infoAssessment.json).
+    -- One row per (exam_slug, zone_number, question_id); multiple question_ids in the
+    -- same slot (PrairieLearn alternatives) share a question_number.
+    createExamQuestionsTableSQL = unlines
+      [ "CREATE TABLE IF NOT EXISTS exam_questions ("
+      , "  exam_slug TEXT NOT NULL,"
+      , "  zone_number INTEGER NOT NULL,"
+      , "  question_number INTEGER NOT NULL,"
+      , "  question_id TEXT NOT NULL,"
+      , "  PRIMARY KEY (exam_slug, zone_number, question_id),"
+      , "  FOREIGN KEY (exam_slug, zone_number) REFERENCES exam_zones(exam_slug, zone_number) ON DELETE CASCADE"
       , ")"
       ]
 
@@ -614,6 +633,72 @@ applyExamQuestionOverride conn netid examSlug zoneNum qNum overrideScore overrid
       , "    override_reason = ?"
       , "WHERE netid = ? AND exam_slug = ? AND zone_number = ? AND question_number = ?"
       ]
+
+-- | Apply an override keyed by question_id (preferred). Returns the number
+-- of rows updated so the caller can hard-fail if zero.
+applyExamQuestionOverrideById :: IConnection conn
+                              => conn -> T.Text -> T.Text -> T.Text
+                              -> Double -> Double -> T.Text -> IO Integer
+applyExamQuestionOverrideById conn netid examSlug qId overrideScore overrideMaxPts reason =
+  run conn updateSQL
+    [ toSql overrideScore
+    , toSql overrideMaxPts
+    , toSql reason
+    , toSql netid
+    , toSql examSlug
+    , toSql qId
+    ]
+  where
+    updateSQL = unlines
+      [ "UPDATE exam_question_scores"
+      , "SET score = GREATEST(score, CAST(? AS REAL)),"
+      , "    max_points = ?,"
+      , "    override_reason = ?"
+      , "WHERE netid = ? AND exam_slug = ? AND question_id = ?"
+      ]
+
+-- | Insert (or update) one row in exam_questions.
+insertExamQuestion :: IConnection conn
+                   => conn -> T.Text -> Int -> Int -> T.Text -> IO ()
+insertExamQuestion conn examSlug zoneNum qNum qId = do
+  _ <- run conn insertSQL
+    [ toSql examSlug
+    , toSql zoneNum
+    , toSql qNum
+    , toSql qId
+    ]
+  return ()
+  where
+    insertSQL = unlines
+      [ "INSERT INTO exam_questions"
+      , "(exam_slug, zone_number, question_number, question_id)"
+      , "VALUES (?, ?, ?, ?)"
+      , "ON CONFLICT (exam_slug, zone_number, question_id) DO UPDATE SET"
+      , "  question_number = EXCLUDED.question_number"
+      ]
+
+-- | Build the (zone_number, question_id) -> question_number lookup map for an exam.
+getExamQuestionMap :: IConnection conn
+                   => conn -> T.Text -> IO (M.Map (Int, T.Text) Int)
+getExamQuestionMap conn examSlug = do
+  results <- quickQuery' conn querySQL [toSql examSlug]
+  return $ M.fromList
+    [ ((fromSql zn, fromSql qi), fromSql qn)
+    | [zn, qn, qi] <- results
+    ]
+  where
+    querySQL = unlines
+      [ "SELECT zone_number, question_number, question_id"
+      , "FROM exam_questions"
+      , "WHERE exam_slug = ?"
+      ]
+
+-- | Delete every exam_questions row for the given exam.
+-- Used by load-exam-zones to drop stale entries before reinserting.
+deleteExamQuestionsForExam :: IConnection conn => conn -> T.Text -> IO ()
+deleteExamQuestionsForExam conn examSlug = do
+  _ <- run conn "DELETE FROM exam_questions WHERE exam_slug = ?" [toSql examSlug]
+  return ()
 
 -- | Get all distinct exam slugs from exam_zones table
 getAllExamSlugs :: IConnection conn => conn -> IO [T.Text]

@@ -6,8 +6,8 @@ module Gradebook.ExamScores
   , parsePrairieLearnCSV
   , extractNetId
   , groupByStudent
-  , buildExamZones
   , buildQuestionScores
+  , missingQuestionMsg
   ) where
 
 import qualified Data.ByteString.Lazy as BL
@@ -15,10 +15,9 @@ import qualified Data.Csv as Csv
 import qualified Data.Text as T
 import qualified Data.Vector as V
 import qualified Data.Map.Strict as M
-import Data.List (sortOn, nub)
 import GHC.Generics (Generic)
 
-import Gradebook.Database (ExamZone(..), ExamQuestionScore(..))
+import Gradebook.Database (ExamQuestionScore(..))
 
 -- | A row from PrairieLearn's instance_questions CSV export
 data PrairieLearnRow = PrairieLearnRow
@@ -68,62 +67,44 @@ groupByStudent :: [PrairieLearnRow] -> M.Map T.Text [PrairieLearnRow]
 groupByStudent rows = M.fromListWith (++)
   [(extractNetId (plrUID r), [r]) | r <- rows]
 
--- | Build ExamZone records from PrairieLearn data
--- This extracts the unique zones and counts questions per zone
-buildExamZones :: T.Text -> [PrairieLearnRow] -> [ExamZone]
-buildExamZones examSlug rows =
-  let -- Get unique (zone_number, zone_title) pairs
-      zonePairs = nub [(plrZoneNumber r, plrZoneTitle r) | r <- rows]
-      -- Sort by zone number
-      sortedZones = sortOn fst zonePairs
-      -- Count questions per zone (assuming each zone has same question count across students)
-      -- We'll count from the first student's data
-      questionCounts = M.fromListWith max
-        [(plrZoneNumber r, countQuestionsInZone (plrZoneNumber r) rows) | r <- rows]
-  in [ ExamZone
-         { ezExamSlug = examSlug
-         , ezZoneNumber = zoneNum
-         , ezZoneTitle = zoneTitle
-         , ezQuestionCount = M.findWithDefault 1 zoneNum questionCounts
-         }
-     | (zoneNum, zoneTitle) <- sortedZones
-     ]
+-- | Build ExamQuestionScore records for a single student. The
+-- @(zone_number, question_id) -> question_number@ map comes from
+-- @exam_questions@ and is the single source of truth for numbering.
+-- If a row's (zone, question_id) is not in the map we hard-fail the
+-- whole load (the JSON on disk has drifted from the CSV).
+buildQuestionScores :: M.Map (Int, T.Text) Int
+                    -> T.Text
+                    -> T.Text
+                    -> [PrairieLearnRow]
+                    -> Either T.Text [ExamQuestionScore]
+buildQuestionScores qmap examSlug netid =
+  traverse one
   where
-    -- Count questions in a zone for any single student
-    countQuestionsInZone :: Int -> [PrairieLearnRow] -> Int
-    countQuestionsInZone zoneNum allRows =
-      let -- Group by student
-          byStudent = groupByStudent allRows
-          -- Get counts for each student
-          counts = [length $ filter (\r -> plrZoneNumber r == zoneNum) studentRows
-                   | studentRows <- M.elems byStudent]
-      in if null counts then 1 else maximum counts
+    one r = case M.lookup (plrZoneNumber r, plrQuestion r) qmap of
+      Nothing -> Left (missingQuestionMsg examSlug netid r)
+      Just qn -> Right ExamQuestionScore
+        { eqsNetId          = netid
+        , eqsExamSlug       = examSlug
+        , eqsZoneNumber     = plrZoneNumber r
+        , eqsQuestionNumber = qn
+        , eqsQuestionId     = plrQuestion r
+        , eqsScore          = plrQuestionPoints r
+        , eqsMaxPoints      = plrMaxPoints r
+        , eqsOverrideReason = Nothing
+        }
 
--- | Build ExamQuestionScore records for a single student
-buildQuestionScores :: T.Text -> T.Text -> [PrairieLearnRow] -> [ExamQuestionScore]
-buildQuestionScores examSlug netid rows =
-  let -- Sort by zone number, then by question within zone
-      sortedRows = sortOn (\r -> (plrZoneNumber r, plrQuestion r)) rows
-      -- Group by zone and number questions within each zone
-      byZone = M.fromListWith (++) [(plrZoneNumber r, [r]) | r <- sortedRows]
-      -- Build question scores with proper numbering
-      questionScores = concatMap (buildZoneQuestions examSlug netid) (M.toList byZone)
-  in questionScores
-
--- | Build question scores for a single zone
-buildZoneQuestions :: T.Text -> T.Text -> (Int, [PrairieLearnRow]) -> [ExamQuestionScore]
-buildZoneQuestions examSlug netid (zoneNum, zoneRows) =
-  let -- Sort rows within zone by question ID for consistent ordering
-      sortedRows = sortOn plrQuestion zoneRows
-  in [ ExamQuestionScore
-         { eqsNetId = netid
-         , eqsExamSlug = examSlug
-         , eqsZoneNumber = zoneNum
-         , eqsQuestionNumber = qNum
-         , eqsQuestionId = plrQuestion row
-         , eqsScore = plrQuestionPoints row
-         , eqsMaxPoints = plrMaxPoints row
-         , eqsOverrideReason = Nothing  -- No override when loading from PrairieLearn
-         }
-     | (qNum, row) <- zip [1..] sortedRows
-     ]
+-- | Human-readable error explaining that a CSV question is unknown
+-- to exam_questions.
+missingQuestionMsg :: T.Text -> T.Text -> PrairieLearnRow -> T.Text
+missingQuestionMsg examSlug netid r = T.unlines
+  [ "Error: PrairieLearn CSV contains a question that is not in exam_questions."
+  , "  exam_slug   = " <> examSlug
+  , "  netid       = " <> netid
+  , "  zone_number = " <> T.pack (show (plrZoneNumber r))
+  , "  zone_title  = " <> plrZoneTitle r
+  , "  question_id = " <> plrQuestion r
+  , ""
+  , "The infoAssessment.json on disk has changed since the last load-exam-zones."
+  , "Re-run:  gb load-exam-zones -e " <> examSlug <> " <path-to-infoAssessment.json>"
+  , "then re-run this load-exam command."
+  ]

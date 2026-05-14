@@ -7,6 +7,8 @@ module Gradebook.Commands
   , runLoadAssignments
   , runLoadScores
   , runLoadExam
+  , runLoadExamZones
+  , runGenExamZones
   , runLoadExamOverrides
   , runGenerateReport
   , runFinalGrades
@@ -37,11 +39,13 @@ import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
 import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), GradingMode(..), CategoryConfig(..), ExamConfig(..), RetakePolicy(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, getAllExamSlugs, getStudentCreditHours, getStudentName)
+import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName)
+import qualified Gradebook.InfoAssessment as IA
 import Gradebook.FinalGrades (FinalGradeRow(..), buildFinalGradeRow, writeFinalGradesXlsx, lastAttendedDate)
 import System.FilePath (takeDirectory)
-import Gradebook.ExamScores (PrairieLearnRow(..), parsePrairieLearnCSV, extractNetId, groupByStudent, buildExamZones, buildQuestionScores)
+import Gradebook.ExamScores (PrairieLearnRow(..), parsePrairieLearnCSV, extractNetId, groupByStudent, buildQuestionScores)
 import Gradebook.ExamOverrides (ExamOverride(..), parseExamOverridesCSV)
+import Gradebook.ExamZonesCSV (ExamZoneRow(..), parseExamZonesCSV, writeExamZonesCSV)
 import Gradebook.GradeCalculation (calculateExamScore, ExamGrade(..), ZoneGrade(..), QuestionGrade(..), CategoryGrade(..))
 import Gradebook.Roster (parseRosterCSV)
 import Gradebook.Categories (parseCategoriesCSV)
@@ -814,6 +818,112 @@ pushReportToGit netid repoPrefix report = do
     putStrLn "Successfully pushed grade report!"
 
 -- | Load exam scores from PrairieLearn CSV
+-- | Load exam zone/question structure from a zones CSV. This populates
+-- @exam_zones@ and @exam_questions@. Must run before @load-exam@.
+runLoadExamZones :: String -> FilePath -> IO ()
+runLoadExamZones examSlugStr csvPath = do
+  let examSlugT = T.pack examSlugStr
+  putStrLn $ "Loading exam zone/question structure for: " ++ examSlugStr
+  putStrLn $ "From file: " ++ csvPath
+
+  config <- loadConfig "config.yaml"
+
+  result <- parseExamZonesCSV csvPath
+  rows <- case result of
+    Left err -> do
+      putStrLn $ "Error parsing zones CSV: " ++ err
+      exitFailure
+    Right r -> return r
+
+  -- Validate: all rows must reference the slug we were given.
+  let wrongSlug = [r | r <- rows, ezrExamSlug r /= examSlugT]
+  when (not (null wrongSlug)) $ do
+    putStrLn $ "Error: zones CSV contains rows with exam_slug != "
+            ++ T.unpack examSlugT
+    mapM_ (\r -> putStrLn $ "  unexpected slug: " ++ T.unpack (ezrExamSlug r)) wrongSlug
+    exitFailure
+
+  -- Aggregate ExamZone records (zone_title + question slot count) from rows.
+  let zoneMap = M.fromListWith mergeZone
+        [ ((ezrZoneNumber r), (ezrZoneTitle r, Set.singleton (ezrQuestionNumber r)))
+        | r <- rows ]
+      mergeZone (t, s1) (_, s2) = (t, s1 `Set.union` s2)
+      zones =
+        [ ExamZone
+            { ezExamSlug      = examSlugT
+            , ezZoneNumber    = zn
+            , ezZoneTitle     = title
+            , ezQuestionCount = Set.size qNums
+            }
+        | (zn, (title, qNums)) <- M.toAscList zoneMap
+        ]
+
+  putStrLn $ "Found " ++ show (length zones) ++ " zones, "
+          ++ show (length rows) ++ " question_id rows"
+
+  conn <- openConnection config
+  initDatabase conn
+
+  mapM_ (insertExamZone conn) zones
+  -- Clean slate so a removed alternative doesn't linger.
+  deleteExamQuestionsForExam conn examSlugT
+  mapM_ (\r -> insertExamQuestion conn examSlugT
+                 (ezrZoneNumber r) (ezrQuestionNumber r) (ezrQuestionId r))
+        rows
+
+  commit conn
+  disconnect conn
+
+  putStrLn $ "Loaded " ++ show (length zones) ++ " zones and "
+          ++ show (length rows) ++ " question alternatives for "
+          ++ examSlugStr
+
+-- | Generate @data-files/<slug>-zones.csv@ from a PrairieLearn
+-- @infoAssessment.json@. Refuses to overwrite an existing output file
+-- unless @--force@ is given.
+runGenExamZones :: String -> FilePath -> Maybe FilePath -> Bool -> IO ()
+runGenExamZones examSlugStr infoPath outPathMaybe force = do
+  let examSlugT = T.pack examSlugStr
+      outPath   = case outPathMaybe of
+                    Just p  -> p
+                    Nothing -> "data-files/" ++ examSlugStr ++ "-zones.csv"
+
+  putStrLn $ "Generating zones CSV for: " ++ examSlugStr
+  putStrLn $ "Reading: " ++ infoPath
+  putStrLn $ "Writing: " ++ outPath
+
+  exists <- doesFileExist outPath
+  when (exists && not force) $ do
+    putStrLn $ "Error: " ++ outPath ++ " already exists. Use --force to overwrite."
+    putStrLn "  (The existing file may contain hand edits — e.g., questions removed"
+    putStrLn "  mid-exam that should stay tracked for historical score data.)"
+    exitFailure
+
+  result <- IA.parseInfoAssessment infoPath
+  info <- case result of
+    Left err -> do
+      putStrLn $ "Error parsing infoAssessment.json: " ++ err
+      exitFailure
+    Right i -> return i
+
+  let titleMap = M.fromList
+        [ (zn, IA.zTitle z) | (zn, z) <- IA.graderZones info ]
+      questions = IA.flattenQuestions info
+      rows =
+        [ ExamZoneRow
+            { ezrExamSlug       = examSlugT
+            , ezrZoneNumber     = zn
+            , ezrZoneTitle      = M.findWithDefault "" zn titleMap
+            , ezrQuestionNumber = qn
+            , ezrQuestionId     = qid
+            , ezrComment        = ""
+            }
+        | (zn, qn, qid) <- questions
+        ]
+
+  writeExamZonesCSV outPath rows
+  putStrLn $ "Wrote " ++ show (length rows) ++ " rows to " ++ outPath
+
 runLoadExam :: String -> FilePath -> IO ()
 runLoadExam examSlugStr scoresPath = do
   let examSlugT = T.pack examSlugStr
@@ -885,12 +995,12 @@ loadExamScoresSimple config examSlugT scoresPath = do
   validStudents <- getAllStudentNetids conn
   let studentSet = Set.fromList validStudents
 
-  -- Build exam zones from the data
-  let zones = buildExamZones examSlugT rows
-  putStrLn $ "Found " ++ show (length zones) ++ " exam zones"
-
-  -- Insert exam zones
-  mapM_ (insertExamZone conn) zones
+  -- Question-number lookup map must already be populated by load-exam-zones.
+  qmap <- getExamQuestionMap conn examSlugT
+  when (M.null qmap) $ do
+    putStrLn $ "Error: no exam_questions rows for exam '" ++ T.unpack examSlugT ++ "'."
+    putStrLn "Run 'gb load-exam-zones -e <slug> <path-to-infoAssessment.json>' first."
+    exitFailure
 
   -- Group rows by student and process each
   let byStudent = groupByStudent rows
@@ -900,7 +1010,7 @@ loadExamScoresSimple config examSlugT scoresPath = do
 
   -- Process each student
   (processedCount, totals) <- foldM
-    (processStudentExamScoresSimple conn studentSet examSlugT)
+    (processStudentExamScoresSimple conn studentSet qmap examSlugT)
     (0, emptyExamDiffTotals)
     (M.toList byStudent)
 
@@ -914,29 +1024,31 @@ loadExamScoresSimple config examSlugT scoresPath = do
 
 -- | Process exam scores for a single student (simple case, no retake)
 processStudentExamScoresSimple :: IConnection conn
-                               => conn -> Set.Set T.Text -> T.Text
+                               => conn -> Set.Set T.Text
+                               -> M.Map (Int, T.Text) Int -> T.Text
                                -> (Int, ExamDiffTotals)
                                -> (T.Text, [PrairieLearnRow])
                                -> IO (Int, ExamDiffTotals)
-processStudentExamScoresSimple conn studentSet examSlugT (count, totals) (netid, studentRows) = do
+processStudentExamScoresSimple conn studentSet qmap examSlugT (count, totals) (netid, studentRows) = do
   -- Skip if student not in database
   if not (Set.member netid studentSet)
     then do
       putStrLn $ "Warning: Student '" ++ T.unpack netid ++ "' not found, skipping"
       return (count, totals)
-    else do
-      -- Build incoming question scores from CSV
-      let questionScores = buildQuestionScores examSlugT netid studentRows
+    else case buildQuestionScores qmap examSlugT netid studentRows of
+      Left err -> do
+        TIO.putStr err
+        exitFailure
+      Right questionScores -> do
+        -- Diff against existing DB rows: skip overridden questions, only write
+        -- rows that are new or actually changed. Overall exam scores are
+        -- computed at report time from exam_question_scores, so this path
+        -- intentionally does NOT write to the `scores` table.
+        existing <- getExamQuestionScoresForStudent conn netid examSlugT
+        let diff = diffExamQuestionScores existing questionScores
+        mapM_ (insertExamQuestionScore conn) (edNew diff ++ edUpdated diff)
 
-      -- Diff against existing DB rows: skip overridden questions, only write
-      -- rows that are new or actually changed. Overall exam scores are
-      -- computed at report time from exam_question_scores, so this path
-      -- intentionally does NOT write to the `scores` table.
-      existing <- getExamQuestionScoresForStudent conn netid examSlugT
-      let diff = diffExamQuestionScores existing questionScores
-      mapM_ (insertExamQuestionScore conn) (edNew diff ++ edUpdated diff)
-
-      return (count + 1, totals `addExamDiff` diff)
+        return (count + 1, totals `addExamDiff` diff)
 
 -- | Load exam scores with retake combination
 loadExamScoresWithRetake :: Config -> ExamConfig -> T.Text -> T.Text -> FilePath -> IO ()
@@ -961,12 +1073,12 @@ loadExamScoresWithRetake config examCfg retakeSlug primarySlug scoresPath = do
   validStudents <- getAllStudentNetids conn
   let studentSet = Set.fromList validStudents
 
-  -- Build exam zones (retake should have same structure as primary)
-  let zones = buildExamZones retakeSlug rows
-  putStrLn $ "Found " ++ show (length zones) ++ " exam zones"
-
-  -- Insert exam zones for retake
-  mapM_ (insertExamZone conn) zones
+  -- Question-number lookup map must already be populated by load-exam-zones.
+  qmap <- getExamQuestionMap conn retakeSlug
+  when (M.null qmap) $ do
+    putStrLn $ "Error: no exam_questions rows for exam '" ++ T.unpack retakeSlug ++ "'."
+    putStrLn "Run 'gb load-exam-zones -e <slug> <path-to-infoAssessment.json>' first."
+    exitFailure
 
   -- Group rows by student
   let byStudent = groupByStudent rows
@@ -976,7 +1088,7 @@ loadExamScoresWithRetake config examCfg retakeSlug primarySlug scoresPath = do
 
   -- Process each student with retake logic
   (processedCount, totals) <- foldM
-    (processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug)
+    (processStudentRetakeScores conn studentSet qmap examCfg retakeSlug primarySlug)
     (0, emptyExamDiffTotals)
     (M.toList byStudent)
 
@@ -990,42 +1102,44 @@ loadExamScoresWithRetake config examCfg retakeSlug primarySlug scoresPath = do
 
 -- | Process retake scores for a single student and combine with original
 processStudentRetakeScores :: IConnection conn
-                           => conn -> Set.Set T.Text -> ExamConfig -> T.Text -> T.Text
+                           => conn -> Set.Set T.Text -> M.Map (Int, T.Text) Int
+                           -> ExamConfig -> T.Text -> T.Text
                            -> (Int, ExamDiffTotals)
                            -> (T.Text, [PrairieLearnRow])
                            -> IO (Int, ExamDiffTotals)
-processStudentRetakeScores conn studentSet examCfg retakeSlug primarySlug (count, totals) (netid, studentRows) = do
+processStudentRetakeScores conn studentSet qmap examCfg retakeSlug primarySlug (count, totals) (netid, studentRows) = do
   -- Skip if student not in database
   if not (Set.member netid studentSet)
     then do
       putStrLn $ "Warning: Student '" ++ T.unpack netid ++ "' not found, skipping"
       return (count, totals)
-    else do
-      -- Build incoming retake scores
-      let retakeScores = buildQuestionScores retakeSlug netid studentRows
+    else case buildQuestionScores qmap retakeSlug netid studentRows of
+      Left err -> do
+        TIO.putStr err
+        exitFailure
+      Right retakeScores -> do
+        -- Diff against existing retake DB rows: skip overrides, write only changes
+        existingRetake <- getExamQuestionScoresForStudent conn netid retakeSlug
+        let diff = diffExamQuestionScores existingRetake retakeScores
+        mapM_ (insertExamQuestionScore conn) (edNew diff ++ edUpdated diff)
 
-      -- Diff against existing retake DB rows: skip overrides, write only changes
-      existingRetake <- getExamQuestionScoresForStudent conn netid retakeSlug
-      let diff = diffExamQuestionScores existingRetake retakeScores
-      mapM_ (insertExamQuestionScore conn) (edNew diff ++ edUpdated diff)
+        -- Compute combined score for the log line only — overall exam scores
+        -- are derived at report time, so we intentionally do NOT write to
+        -- the `scores` table here.
+        originalScores <- getExamQuestionScoresForStudent conn netid primarySlug
+        let effectiveRetake = mergeWithOverrides existingRetake retakeScores
+            origTuples    = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- originalScores]
+            retakeTuples  = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- effectiveRetake]
+            combinedScore = calculateExamScore
+              (examRetakePolicy examCfg)
+              Nothing
+              origTuples
+              retakeTuples
+              []
 
-      -- Compute combined score for the log line only — overall exam scores
-      -- are derived at report time, so we intentionally do NOT write to
-      -- the `scores` table here.
-      originalScores <- getExamQuestionScoresForStudent conn netid primarySlug
-      let effectiveRetake = mergeWithOverrides existingRetake retakeScores
-          origTuples    = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- originalScores]
-          retakeTuples  = [(eqsZoneNumber s, eqsQuestionNumber s, eqsScore s, eqsMaxPoints s) | s <- effectiveRetake]
-          combinedScore = calculateExamScore
-            (examRetakePolicy examCfg)
-            Nothing
-            origTuples
-            retakeTuples
-            []
+        putStrLn $ "  " ++ T.unpack netid ++ ": combined score = " ++ show (combinedScore * 100) ++ "%"
 
-      putStrLn $ "  " ++ T.unpack netid ++ ": combined score = " ++ show (combinedScore * 100) ++ "%"
-
-      return (count + 1, totals `addExamDiff` diff)
+        return (count + 1, totals `addExamDiff` diff)
 
 -- | Result of diffing an incoming batch of question scores against the DB
 -- for a single (netid, exam_slug). Override rows are removed from the
@@ -1171,28 +1285,36 @@ runLoadExamOverrides examSlugStr overridesPath = do
 
   putStrLn $ "Successfully applied " ++ show appliedCount ++ " overrides"
 
--- | Apply a single override (helper)
+-- | Apply a single override. Hard-fails the whole load if the target row
+-- doesn't exist (typo in question_id or missing student CSV row).
 applyOverride :: IConnection conn => conn -> Set.Set T.Text -> T.Text -> Int -> ExamOverride -> IO Int
 applyOverride conn studentSet examSlugT count override = do
   let netid = eoNetId override
+      qid   = eoQuestionId override
   if not (Set.member netid studentSet)
     then do
       putStrLn $ "Warning: Student '" ++ T.unpack netid ++ "' not found, skipping"
       return count
     else do
-      applyExamQuestionOverride conn
-        netid
-        examSlugT
-        (eoZoneNumber override)
-        (eoQuestionNumber override)
-        (eoScore override)
-        (eoMaxPoints override)
-        (eoReason override)
-      putStrLn $ "  Applied override for " ++ T.unpack netid ++
-                 " zone " ++ show (eoZoneNumber override) ++
-                 " question " ++ show (eoQuestionNumber override) ++
-                 ": " ++ T.unpack (eoReason override)
-      return (count + 1)
+      n <- applyExamQuestionOverrideById conn
+             netid
+             examSlugT
+             qid
+             (eoScore override)
+             (eoMaxPoints override)
+             (eoReason override)
+      if n == 0
+        then do
+          putStrLn $ "Error: no exam_question_scores row for " ++ T.unpack netid
+                  ++ " on " ++ T.unpack examSlugT ++ " question_id '" ++ T.unpack qid ++ "'."
+          putStrLn   "  Possible causes: question_id typo, student did not attempt this exam,"
+          putStrLn   "  or exam_question_scores has not been populated for this student."
+          exitFailure
+        else do
+          putStrLn $ "  Applied override for " ++ T.unpack netid ++
+                     " " ++ T.unpack qid ++
+                     ": " ++ T.unpack (eoReason override)
+          return (count + 1)
 
 -- | Mark assignments as collected (updates both DB and CSV)
 runMarkCollected :: [String] -> IO ()

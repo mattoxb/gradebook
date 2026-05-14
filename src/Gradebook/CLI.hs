@@ -8,7 +8,7 @@ module Gradebook.CLI
 
 import Options.Applicative
 import qualified Data.Text as T
-import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides)
+import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides, runLoadExamZones, runGenExamZones)
 import Gradebook.Version (versionString)
 
 data Command
@@ -23,6 +23,16 @@ data Command
       }
   | LoadScores
       { scoresFile :: FilePath
+      }
+  | LoadExamZones
+      { zonesExamSlug :: String
+      , zonesCsvFile  :: FilePath
+      }
+  | GenExamZones
+      { genZonesExamSlug   :: String
+      , genInfoAssessment  :: FilePath
+      , genZonesOutFile    :: Maybe FilePath
+      , genZonesForce      :: Bool
       }
   | LoadExam
       { examSlug       :: String
@@ -88,6 +98,45 @@ loadScoresParser = LoadScores
      <> help "Path to scores CSV file"
       )
 
+-- | Parser for LoadExamZones command
+loadExamZonesParser :: Parser Command
+loadExamZonesParser = LoadExamZones
+  <$> strOption
+      ( long "exam"
+     <> short 'e'
+     <> metavar "SLUG"
+     <> help "Exam assignment slug (e.g., exam-1)"
+      )
+  <*> strArgument
+      ( metavar "FILE"
+     <> help "Path to exam zones CSV (typically data-files/<slug>-zones.csv)"
+      )
+
+-- | Parser for GenExamZones command
+genExamZonesParser :: Parser Command
+genExamZonesParser = GenExamZones
+  <$> strOption
+      ( long "exam"
+     <> short 'e'
+     <> metavar "SLUG"
+     <> help "Exam assignment slug (e.g., exam-1)"
+      )
+  <*> strArgument
+      ( metavar "INFO_JSON"
+     <> help "Path to PrairieLearn infoAssessment.json"
+      )
+  <*> optional (strOption
+      ( long "output"
+     <> short 'o'
+     <> metavar "FILE"
+     <> help "Output CSV path (default: data-files/<slug>-zones.csv)"
+      ))
+  <*> switch
+      ( long "force"
+     <> short 'f'
+     <> help "Overwrite output file if it already exists"
+      )
+
 -- | Parser for LoadExam command
 loadExamParser :: Parser Command
 loadExamParser = LoadExam
@@ -113,7 +162,7 @@ loadExamOverridesParser = LoadExamOverrides
       )
   <*> strArgument
       ( metavar "FILE"
-     <> help "Path to overrides CSV file (netid,zone_number,question_number,score,max_points,reason)"
+     <> help "Path to overrides CSV file (netid,question_id,score,max_points,reason)"
       )
 
 -- | Parser for GenerateReport command
@@ -182,9 +231,17 @@ commandParser = hsubparser
     ( info loadScoresParser
       ( progDesc "Load scores CSV into the database" )
     )
+  <> command "gen-exam-zones"
+    ( info genExamZonesParser
+      ( progDesc "Generate data-files/<slug>-zones.csv from a PrairieLearn infoAssessment.json (refuses to overwrite without --force)" )
+    )
+  <> command "load-exam-zones"
+    ( info loadExamZonesParser
+      ( progDesc "Load exam zone/question structure from a zones CSV (must run before load-exam)" )
+    )
   <> command "load-exam"
     ( info loadExamParser
-      ( progDesc "Load exam scores from PrairieLearn CSV (zones and question scores)" )
+      ( progDesc "Load exam scores from PrairieLearn CSV (requires load-exam-zones to have run first)" )
     )
   <> command "load-exam-overrides"
     ( info loadExamOverridesParser
@@ -227,6 +284,8 @@ run cmd = case cmd of
   LoadCategories{categoriesFile = path} -> runLoadCategories path
   LoadAssignments{assignmentsFile = path} -> runLoadAssignments path
   LoadScores{scoresFile = path} -> runLoadScores path
+  LoadExamZones{zonesExamSlug = slug, zonesCsvFile = path} -> runLoadExamZones slug path
+  GenExamZones{genZonesExamSlug = slug, genInfoAssessment = jsonPath, genZonesOutFile = out, genZonesForce = force} -> runGenExamZones slug jsonPath out force
   LoadExam{examSlug = slug, examScoresFile = path} -> runLoadExam slug path
   LoadExamOverrides{overrideExamSlug = slug, overridesFile = path} -> runLoadExamOverrides slug path
   GenerateReport{reportNetId = netid, pushToGit = push, reportAll = all'} -> runGenerateReport netid push all'

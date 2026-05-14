@@ -12,26 +12,28 @@ import qualified Data.Text as T
 import qualified Data.Vector as V
 import GHC.Generics (Generic)
 
--- | An override record for an exam question score
+-- | An override record for an exam question score.
+--
+-- Keyed by @question_id@ (the PrairieLearn question slug) rather than
+-- @(zone_number, question_number)@ — the former is stable across JSON
+-- reordering and is what graders see in PL.
 data ExamOverride = ExamOverride
-  { eoNetId          :: T.Text   -- ^ Student netid
-  , eoZoneNumber     :: Int      -- ^ Zone number (1-indexed)
-  , eoQuestionNumber :: Int      -- ^ Question number within zone (1-indexed)
-  , eoScore          :: Double   -- ^ Override score (will take max with existing)
-  , eoMaxPoints      :: Double   -- ^ Max points for this question
-  , eoReason         :: T.Text   -- ^ Reason for the override
+  { eoNetId      :: T.Text   -- ^ Student netid
+  , eoQuestionId :: T.Text   -- ^ PrairieLearn question slug
+  , eoScore      :: Double   -- ^ Override score (will take max with existing)
+  , eoMaxPoints  :: Double   -- ^ Max points for this question
+  , eoReason     :: T.Text   -- ^ Reason for the override
   } deriving (Show, Eq, Generic)
 
 instance Csv.FromNamedRecord ExamOverride where
   parseNamedRecord r = ExamOverride
     <$> r Csv..: "netid"
-    <*> r Csv..: "zone_number"
-    <*> r Csv..: "question_number"
+    <*> r Csv..: "question_id"
     <*> r Csv..: "score"
     <*> r Csv..: "max_points"
     <*> r Csv..: "reason"
 
--- | Parse an exam overrides CSV file
+-- | Parse an exam overrides CSV file.
 parseExamOverridesCSV :: FilePath -> IO (Either String [ExamOverride])
 parseExamOverridesCSV path = do
   contents <- BL.readFile path
