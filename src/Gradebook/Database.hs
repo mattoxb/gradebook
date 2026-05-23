@@ -17,6 +17,8 @@ module Gradebook.Database
   , getAllCategories
   , getAllAssignmentSlugs
   , getAllStudentNetids
+  , getEnrolledStatusMap
+  , setStudentsEnrolled
   , getAllStudentIdentifiers
   -- Exam-related exports
   , ExamZone(..)
@@ -33,6 +35,7 @@ module Gradebook.Database
   , getAllExamSlugs
   , getStudentCreditHours
   , getStudentName
+  , getStudentEmail
   ) where
 
 import Database.HDBC
@@ -109,6 +112,16 @@ data ExamQuestionScore = ExamQuestionScore
   , eqsOverrideReason :: Maybe T.Text  -- ^ Reason for manual override (if any)
   } deriving (Show, Eq)
 
+-- | Convert a boolean-column SqlValue to Bool.
+-- PostgreSQL boolean columns come back as SqlBool; NULL maps to False.
+-- (SqlInteger fallbacks remain for any legacy/coerced rows.)
+sqlToBool :: SqlValue -> Bool
+sqlToBool SqlNull        = False
+sqlToBool (SqlBool b)    = b
+sqlToBool (SqlInteger 0) = False
+sqlToBool (SqlInteger _) = True
+sqlToBool other          = fromSql other
+
 -- | Initialize the database schema
 initDatabase :: IConnection conn => conn -> IO ()
 initDatabase conn = do
@@ -119,6 +132,9 @@ initDatabase conn = do
   _ <- run conn createExamZonesTableSQL []
   _ <- run conn createExamQuestionsTableSQL []
   _ <- run conn createExamQuestionScoresTableSQL []
+  -- Migration: add students.enrolled to databases created before v0.13.0.
+  -- Idempotent; existing rows default to TRUE (correct — they were enrolled).
+  _ <- run conn "ALTER TABLE students ADD COLUMN IF NOT EXISTS enrolled BOOLEAN NOT NULL DEFAULT TRUE" []
   commit conn
   where
     createStudentsTableSQL = unlines
@@ -143,7 +159,8 @@ initDatabase conn = do
       , "  program_name TEXT,"
       , "  ferpa TEXT,"
       , "  honors_credit TEXT,"
-      , "  advisors TEXT"
+      , "  advisors TEXT,"
+      , "  enrolled BOOLEAN NOT NULL DEFAULT TRUE"
       , ")"
       ]
 
@@ -254,8 +271,8 @@ insertStudent conn student = do
       [ "INSERT INTO students"
       , "(netid, uin, admit_term, gender, name, email, credit, level, year,"
       , " subject, number, section, crn, degree_name, major_1_name, college,"
-      , " program_code, program_name, ferpa, honors_credit, advisors)"
-      , "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      , " program_code, program_name, ferpa, honors_credit, advisors, enrolled)"
+      , "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)"
       , "ON CONFLICT (netid) DO UPDATE SET"
       , "  uin = EXCLUDED.uin,"
       , "  admit_term = EXCLUDED.admit_term,"
@@ -276,7 +293,8 @@ insertStudent conn student = do
       , "  program_name = EXCLUDED.program_name,"
       , "  ferpa = EXCLUDED.ferpa,"
       , "  honors_credit = EXCLUDED.honors_credit,"
-      , "  advisors = EXCLUDED.advisors"
+      , "  advisors = EXCLUDED.advisors,"
+      , "  enrolled = TRUE"  -- present in the CSV => (re-)enrolled
       ]
 
 -- | Search for students by netid, name, email, or UIN
@@ -392,23 +410,7 @@ getAssignmentsByCategory conn categorySlug = do
         (fromSql slug')
         (fromSql maxPoints')
         (fromSql title')
-        (sqlValueToBool' collected')
-      where
-        -- Helper to convert SqlValue to Bool (handles both INTEGER and TEXT)
-        sqlValueToBool' :: SqlValue -> Bool
-        sqlValueToBool' SqlNull = False
-        sqlValueToBool' (SqlBool b) = b
-        sqlValueToBool' (SqlInteger 0) = False
-        sqlValueToBool' (SqlInteger _) = True
-        sqlValueToBool' (SqlInt32 0) = False
-        sqlValueToBool' (SqlInt32 _) = True
-        sqlValueToBool' (SqlInt64 0) = False
-        sqlValueToBool' (SqlInt64 _) = True
-        sqlValueToBool' (SqlString "False") = False
-        sqlValueToBool' (SqlString "false") = False
-        sqlValueToBool' (SqlString "0") = False
-        sqlValueToBool' (SqlString "") = False
-        sqlValueToBool' _ = True
+        (sqlToBool collected')
     rowToAssignment _ = error "Unexpected row format from assignments query"
 
 -- | Get all scores for a specific student
@@ -431,29 +433,13 @@ getScoresForStudent conn netid = do
       , case score' of
           SqlNull -> Nothing
           _ -> Just (fromSql score')
-      , sqlValueToBool excused'
+      , sqlToBool excused'
       , fromSql maxPoints'
       , fromSql category'
       , fromSql title'
-      , sqlValueToBool collected'
+      , sqlToBool collected'
       )
     rowToScoreTuple _ = error "Unexpected row format from scores query"
-
-    -- Helper to convert SqlValue to Bool (handles INTEGER, TEXT, and BOOLEAN)
-    sqlValueToBool :: SqlValue -> Bool
-    sqlValueToBool SqlNull = False
-    sqlValueToBool (SqlBool b) = b
-    sqlValueToBool (SqlInteger 0) = False
-    sqlValueToBool (SqlInteger _) = True
-    sqlValueToBool (SqlInt32 0) = False
-    sqlValueToBool (SqlInt32 _) = True
-    sqlValueToBool (SqlInt64 0) = False
-    sqlValueToBool (SqlInt64 _) = True
-    sqlValueToBool (SqlString "False") = False
-    sqlValueToBool (SqlString "false") = False
-    sqlValueToBool (SqlString "0") = False
-    sqlValueToBool (SqlString "") = False
-    sqlValueToBool _ = True
 
 -- | Get every score in the database, keyed by (netid, assignment).
 -- Used to diff incoming CSV against existing rows so loads can report
@@ -469,24 +455,10 @@ getAllScores conn = do
       , ( case score' of
             SqlNull -> Nothing
             _       -> Just (fromSql score')
-        , toBool excused'
+        , sqlToBool excused'
         )
       )
     rowToEntry _ = error "Unexpected row format from scores query"
-
-    toBool SqlNull            = False
-    toBool (SqlBool b)        = b
-    toBool (SqlInteger 0)     = False
-    toBool (SqlInteger _)     = True
-    toBool (SqlInt32 0)       = False
-    toBool (SqlInt32 _)       = True
-    toBool (SqlInt64 0)       = False
-    toBool (SqlInt64 _)       = True
-    toBool (SqlString "False") = False
-    toBool (SqlString "false") = False
-    toBool (SqlString "0")    = False
-    toBool (SqlString "")     = False
-    toBool _                  = True
 
 -- | Get all category slugs from the database
 getAllCategories :: IConnection conn => conn -> IO [T.Text]
@@ -505,6 +477,23 @@ getAllStudentNetids :: IConnection conn => conn -> IO [T.Text]
 getAllStudentNetids conn = do
   results <- quickQuery' conn "SELECT netid FROM students" []
   return $ map (\[netid'] -> fromSql netid') results
+
+-- | Map every student's netid to their current enrolled flag.
+-- Used by load-roster to diff the incoming CSV against the DB (added/dropped/re-added).
+getEnrolledStatusMap :: IConnection conn => conn -> IO (M.Map T.Text Bool)
+getEnrolledStatusMap conn = do
+  results <- quickQuery' conn "SELECT netid, enrolled FROM students" []
+  return $ M.fromList [ (fromSql n, sqlToBool e) | [n, e] <- results ]
+
+-- | Set the enrolled flag for a list of netids in one statement.
+-- No-op on an empty list.
+setStudentsEnrolled :: IConnection conn => conn -> Bool -> [T.Text] -> IO ()
+setStudentsEnrolled _ _ [] = return ()
+setStudentsEnrolled conn flag netids = do
+  let placeholders = T.intercalate "," (replicate (length netids) "?")
+      sql = "UPDATE students SET enrolled = ? WHERE netid IN (" <> T.unpack placeholders <> ")"
+  _ <- run conn sql (toSql flag : map toSql netids)
+  return ()
 
 -- | Get (netid, uin, crn, name) for every student. Used by the final-grade
 -- spreadsheet, which doesn't need the full roster record.
@@ -625,7 +614,6 @@ applyExamQuestionOverride conn netid examSlug zoneNum qNum overrideScore overrid
   return ()
   where
     -- Use GREATEST to take the better score; update reason regardless
-    -- GREATEST works in both PostgreSQL and SQLite (3.38+)
     updateSQL = unlines
       [ "UPDATE exam_question_scores"
       , "SET score = GREATEST(score, CAST(? AS REAL)),"
@@ -728,4 +716,15 @@ getStudentName conn netid = do
       case nameVal of
         SqlNull -> return Nothing
         _ -> return (Just (fromSql nameVal))
+    _ -> return Nothing
+
+-- | Get a student's email from the database
+getStudentEmail :: IConnection conn => conn -> T.Text -> IO (Maybe T.Text)
+getStudentEmail conn netid = do
+  results <- quickQuery' conn "SELECT email FROM students WHERE netid = ?" [toSql netid]
+  case results of
+    [[emailVal]] ->
+      case emailVal of
+        SqlNull -> return Nothing
+        _ -> return (Just (fromSql emailVal))
     _ -> return Nothing

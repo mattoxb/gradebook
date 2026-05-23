@@ -1,5 +1,5 @@
 name:                gradebook
-version:             0.12.0.0
+version:             0.13.0.0
 github:              "mattox/gradebook"
 license:             BSD3
 author:              "Mattox"
@@ -21,7 +21,6 @@ dependencies:
 - cassava >= 0.5          # CSV parsing
 - vector >= 0.13
 - HDBC >= 2.4
-- HDBC-sqlite3 >= 2.3
 - HDBC-postgresql >= 2.5
 - process >= 1.6          # for fzf integration
 - directory >= 1.3

@@ -51,7 +51,7 @@ direnv allow
 - **System-wide update:** `nix profile upgrade gradebook`
 
 ### Available Commands
-- `gb load-roster [-r FILE]`: Load roster CSV into database
+- `gb load-roster [-r FILE]`: Load roster CSV into database. Prints an add/drop report (netid, name, email) of students *added*, *re-added* (previously dropped, now back), and *dropped* (in DB but absent from the CSV). Dropped students are marked `students.enrolled = FALSE` but **kept** in the DB along with their scores; anyone present in the CSV is set `enrolled = TRUE`. Idempotent: re-loading the same CSV reports 0/0/0. Useful during the first ~10 days of add/drop churn.
 - `gb load-categories [-c FILE]`: Load grade categories
 - `gb load-assignments [-a FILE]`: Load assignments
 - `gb load-scores FILE`: Load student scores from CSV
@@ -76,7 +76,7 @@ The zones CSV is hand-editable and authoritative — not the JSON. PrairieLearn'
 ### Nix Configuration Details
 - GHC version: 9.8.4 (configured in flake.nix via haskell.nix)
 - Haskell Language Server (HLS) is available in dev shell
-- PostgreSQL and SQLite clients available for database access
+- PostgreSQL client available for database access
 
 ## Code Architecture
 
@@ -106,7 +106,7 @@ app/
 
 ### Key Components
 
-- **Database Layer** (Database.hs): Uses HDBC for database abstraction, supporting both SQLite3 and PostgreSQL. Tables: `students`, `categories`, `assignments`, `scores`, `exam_zones`, `exam_questions`, `exam_question_scores`.
+- **Database Layer** (Database.hs): Uses HDBC over **PostgreSQL** (SQLite support was removed in v0.13.0). Tables: `students`, `categories`, `assignments`, `scores`, `exam_zones`, `exam_questions`, `exam_question_scores`. `initDatabase` is the poor-man's migration tool: every table is `CREATE TABLE IF NOT EXISTS` and column additions are done with idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (e.g. `students.enrolled`), so it's safe to re-run against an existing course DB. There is no ORM / no auto-migration framework.
 
 - **Configuration** (Config.hs): Reads `config.yaml` for database settings, grading configuration (weighted/pass-fail/letter-grade modes), category weights, and exam configurations.
 
@@ -123,7 +123,7 @@ app/
 ### Database Schema
 
 **Core Tables:**
-- `students`: Student roster (netid PK, uin, name, email, etc.)
+- `students`: Student roster (netid PK, uin, name, email, etc.). `enrolled BOOLEAN NOT NULL DEFAULT TRUE` tracks add/drop status — set FALSE by `load-roster` when a student disappears from the roster CSV. Dropped students (and their scores) are retained, not deleted. Note: no other command filters on `enrolled` yet; it's currently informational + drives the `load-roster` add/drop report.
 - `categories`: Grade categories (slug PK, title)
 - `assignments`: Assignments (slug PK, order_num, category FK, max_points, title, collected)
 - `scores`: Student scores (netid FK, assignment FK, score, excused)
@@ -136,8 +136,8 @@ app/
 ### Configuration Example
 
 ```yaml
-database: cs421-grades-sp26.db
-db-type: sqlite3  # or postgresql
+database: cs421-grades-sp26   # PostgreSQL database name (passed as dbname=...)
+db-type: postgresql           # optional; only 'postgresql' is supported (SQLite removed in v0.13.0)
 repo-prefix: "https://github.com/org/prefix_"
 term-code: "120261"  # required by `gb final-grades`; UIUC Banner term code
 

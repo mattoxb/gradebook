@@ -19,7 +19,6 @@ module Gradebook.Commands
   ) where
 
 import Database.HDBC
-import Database.HDBC.Sqlite3 (connectSqlite3)
 import Database.HDBC.PostgreSQL (connectPostgreSQL)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -32,14 +31,14 @@ import Control.Monad (when, foldM)
 import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as M
-import Data.List (find)
+import Data.List (find, sortOn)
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Csv as Csv
 import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
-import Gradebook.Config (Config(..), DbType(..), GradingConfig(..), GradingMode(..), CategoryConfig(..), ExamConfig(..), RetakePolicy(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName)
+import Gradebook.Config (Config(..), GradingConfig(..), GradingMode(..), CategoryConfig(..), ExamConfig(..), RetakePolicy(..), loadConfig)
+import Gradebook.Database (initDatabase, insertStudent, Student(..), insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getEnrolledStatusMap, setStudentsEnrolled, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName, getStudentEmail)
 import qualified Gradebook.InfoAssessment as IA
 import Gradebook.FinalGrades (FinalGradeRow(..), buildFinalGradeRow, writeFinalGradesXlsx, lastAttendedDate)
 import System.FilePath (takeDirectory)
@@ -55,22 +54,16 @@ import Gradebook.GradeCalculation (calculateGrades, evaluateRequirements)
 import Gradebook.Reports (ReportData(..), generateReport)
 import qualified Data.HashMap.Strict as HM
 
--- | Open database connection based on config
--- Returns a ConnWrapper to allow different backend types
+-- | Open a PostgreSQL connection based on config.
+-- Returns a ConnWrapper for compatibility with the rest of the DB layer.
 openConnection :: Config -> IO ConnWrapper
-openConnection config = case dbType config of
-  SQLite -> do
-    conn <- connectSqlite3 (T.unpack $ database config)
-    -- Enable foreign key constraints (must be done per connection)
-    _ <- quickQuery' conn "PRAGMA foreign_keys = ON" []
-    return (ConnWrapper conn)
-  PostgreSQL -> do
-    let connStr = "dbname=" ++ T.unpack (database config)
-    conn <- connectPostgreSQL connStr
-    -- Suppress NOTICE-level chatter (e.g. "relation already exists, skipping"
-    -- from CREATE TABLE IF NOT EXISTS during initDatabase).
-    _ <- run conn "SET client_min_messages = WARNING" []
-    return (ConnWrapper conn)
+openConnection config = do
+  let connStr = "dbname=" ++ T.unpack (database config)
+  conn <- connectPostgreSQL connStr
+  -- Suppress NOTICE-level chatter (e.g. "relation already exists, skipping"
+  -- from CREATE TABLE IF NOT EXISTS during initDatabase).
+  _ <- run conn "SET client_min_messages = WARNING" []
+  return (ConnWrapper conn)
 
 -- | Load roster CSV into database
 runLoadRoster :: FilePath -> IO ()
@@ -93,17 +86,60 @@ runLoadRoster rosterPath = do
   -- Connect to database
   conn <- openConnection config
 
-  -- Initialize database schema
+  -- Initialize database schema (also runs the enrolled-column migration)
   initDatabase conn
 
-  -- Insert each student
+  -- Snapshot the prior enrolled state BEFORE inserting, so we can diff the
+  -- incoming roster against it (added / re-added / dropped).
+  priorStatus <- getEnrolledStatusMap conn
+  let csvNetids   = Set.fromList (map netId students)
+      dbNetids    = Set.fromList (M.keys priorStatus)
+      -- In the CSV but not in the DB at all => brand-new student.
+      newlyAdded  = Set.toList (csvNetids `Set.difference` dbNetids)
+      -- In the CSV and in the DB, but was previously dropped => returning student.
+      reAdded     = [ n | n <- Set.toList (csvNetids `Set.intersection` dbNetids)
+                        , M.lookup n priorStatus == Just False ]
+      -- In the DB but absent from the CSV => dropped.
+      dropped     = Set.toList (dbNetids `Set.difference` csvNetids)
+
+  -- Insert each student. insertStudent sets enrolled = TRUE, so anyone in the
+  -- CSV (including returning students) is (re-)enrolled.
   mapM_ (insertStudent conn) students
+
+  -- Mark dropped students enrolled = FALSE. Their rows (and scores) stay in the DB.
+  setStudentsEnrolled conn False dropped
 
   -- Commit and close
   commit conn
+
+  -- For added / re-added students, name and email come straight from the CSV.
+  let csvInfoMap = M.fromList [ (netId s, (name s, email s)) | s <- students ]
+      fromCsv n  = let (nm, em) = M.findWithDefault (n, "") n csvInfoMap
+                   in (n, T.unpack nm, T.unpack em)
+  -- Dropped students aren't in the CSV; look name + email up in the DB.
+  droppedInfo <- mapM (\n -> do mnm <- getStudentName conn n
+                                mem <- getStudentEmail conn n
+                                return ( n
+                                       , maybe (T.unpack n) T.unpack mnm
+                                       , maybe "" T.unpack mem ))
+                      dropped
   disconnect conn
 
   putStrLn $ "Successfully loaded " ++ show (length students) ++ " students into database"
+  putStrLn ""
+  reportRosterChange "Added (new)" (map fromCsv newlyAdded)
+  reportRosterChange "Re-added"    (map fromCsv reAdded)
+  reportRosterChange "Dropped"     droppedInfo
+  where
+    reportRosterChange :: String -> [(T.Text, String, String)] -> IO ()
+    reportRosterChange label entries = do
+      putStrLn $ label ++ " (" ++ show (length entries) ++ "):"
+      if null entries
+        then putStrLn "  (none)"
+        else mapM_ (\(n, nm, em) ->
+                      putStrLn $ "  " ++ T.unpack n ++ "  " ++ nm ++ "  <" ++ em ++ ">")
+                   (sortOn (\(_, nm, _) -> nm) entries)
+      putStrLn ""
 
 -- | Load categories CSV into database
 runLoadCategories :: FilePath -> IO ()

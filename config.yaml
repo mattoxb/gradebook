@@ -1,5 +1,5 @@
-database: test-grades.db
-db-type: sqlite3
+database: test-grades
+db-type: postgresql
 
 grading:
   mode: weighted

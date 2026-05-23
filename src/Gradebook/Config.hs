@@ -3,7 +3,6 @@
 
 module Gradebook.Config
   ( Config(..)
-  , DbType(..)
   , GradingConfig(..)
   , GradingMode(..)
   , CategoryConfig(..)
@@ -21,16 +20,6 @@ import Data.Aeson (withObject, withText)
 import qualified Data.Text as T
 import qualified Data.HashMap.Strict as HM
 import GHC.Generics (Generic)
-
-data DbType = SQLite | PostgreSQL
-  deriving (Show, Eq, Generic)
-
-instance FromJSON DbType where
-  parseJSON = withText "DbType" $ \dbTypeStr ->
-    case dbTypeStr of
-      "sqlite3"    -> return SQLite
-      "postgresql" -> return PostgreSQL
-      _            -> fail "db-type must be 'sqlite3' or 'postgresql'"
 
 -- | Grading mode
 data GradingMode = Weighted | PassFail | LetterGrade
@@ -203,7 +192,6 @@ instance FromJSON GradingConfig where
 
 data Config = Config
   { database    :: T.Text
-  , dbType      :: DbType
   , repoPrefix  :: Maybe T.Text
   , termCode    :: Maybe T.Text
   , grading     :: Maybe GradingConfig
@@ -212,11 +200,17 @@ data Config = Config
 instance FromJSON Config where
   parseJSON = withObject "Config" $ \v -> do
     db <- v .: "database"
-    dt <- v .: "db-type"
+    -- db-type is accepted for backward compatibility but must be postgresql.
+    -- (SQLite support was removed in v0.13.0.)
+    dt <- v .:? "db-type" .!= ("postgresql" :: T.Text)
+    case dt of
+      "postgresql" -> return ()
+      other        -> fail $ "db-type must be 'postgresql' (got '" <> T.unpack other
+                              <> "'); SQLite is no longer supported"
     rp <- v .:? "repo-prefix"
     tc <- v .:? "term-code"
     gr <- v .:? "grading"
-    return $ Config db dt rp tc gr
+    return $ Config db rp tc gr
 
 -- | Load configuration from config.yaml
 loadConfig :: FilePath -> IO Config

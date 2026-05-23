@@ -28,7 +28,6 @@
 
                 buildInputs = with pkgs; [
                   postgresql
-                  sqlite
                   fzf
                   git
                 ];
