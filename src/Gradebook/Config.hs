@@ -177,6 +177,7 @@ data GradingConfig = GradingConfig
   , gradeThresholds   :: [GradeThreshold]                -- for letter-grade mode
   , exams             :: [ExamConfig]                    -- exam configurations
   , reportFormat      :: T.Text                          -- report format identifier (e.g., "default", "cs421-v1", "cs491-v1")
+  , showLetterGrade   :: Bool                            -- emit the letter grade in `gb report`? (default False; flip after the last midterm)
   } deriving (Show, Eq, Generic)
 
 instance FromJSON GradingConfig where
@@ -188,7 +189,10 @@ instance FromJSON GradingConfig where
     thresholds <- v .:? "grade-thresholds" .!= []
     examConfigs <- v .:? "exams" .!= []
     fmt <- v .:? "report-format" .!= "default"
-    return $ GradingConfig mode cats pols reqs thresholds examConfigs fmt
+    -- Default False: early-semester reports show a numeric total but NOT the
+    -- letter grade (which would read "F" for everyone before grades exist).
+    showLetter <- v .:? "show-letter-grade" .!= False
+    return $ GradingConfig mode cats pols reqs thresholds examConfigs fmt showLetter
 
 data Config = Config
   { database    :: T.Text

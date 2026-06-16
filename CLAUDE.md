@@ -55,6 +55,7 @@ direnv allow
 - `gb load-categories [-c FILE]`: Load grade categories
 - `gb load-assignments [-a FILE]`: Load assignments
 - `gb load-scores FILE`: Load student scores from CSV
+- `gb load-penalties [-p FILE]`: Load letter-grade-reduction penalties CSV (`netid,steps,reason`; default `data-files/penalties.csv`) into the `penalties` table. `steps` is how many notches to drop the student's *computed* letter grade down the `grade-thresholds` list (1 step = A → A-). Applied at `final-grades` time, never stored as a computed letter. Idempotent and CSV-authoritative: re-loading converges to the file (penalties for students no longer listed are deleted); unknown netids are warned and skipped.
 - `gb gen-exam-zones -e SLUG INFO_JSON [-o FILE] [--force]`: Generate `data-files/<slug>-zones.csv` from a PrairieLearn `infoAssessment.json` (refuses to overwrite without `--force`)
 - `gb load-exam-zones -e SLUG FILE`: Load zone/question structure from a zones CSV (run before `load-exam`)
 - `gb load-exam -e SLUG FILE`: Load exam scores from PrairieLearn CSV — hard-fails if a question_id is missing from `exam_questions`
@@ -62,7 +63,7 @@ direnv allow
 - `gb report [-n NETID] [-p] [-a]`: Generate grade report
 - `gb final-grades [-o FILE]`: Write registrar upload spreadsheet (.xlsx) — needs `term-code` and `grade-thresholds` in config
 - `gb collect SLUG...`: Mark assignments as collected
-- `gb netid`: Interactive student search using fzf
+- `gb netid [--email] [-m|--multi]`: Interactive student search using fzf. `--email` prints the email column instead of the netid; `--multi` enables fzf multi-select (Tab to mark) and prints one identifier per selected line.
 - `gb version`: Show version information
 
 ### Load Command Invariants
@@ -90,6 +91,7 @@ src/Gradebook/
 ├── Categories.hs    -- CSV categories parsing
 ├── Assignments.hs   -- CSV assignments parsing
 ├── Scores.hs        -- CSV scores parsing
+├── Penalties.hs     -- CSV penalties parsing + applyGradeReduction (letter-grade notch-down)
 ├── ExamScores.hs    -- PrairieLearn exam CSV parsing (uses exam_questions for question_number lookup)
 ├── ExamOverrides.hs -- Exam score override parsing (CSV keyed on question_id)
 ├── ExamZonesCSV.hs  -- Read/write data-files/<slug>-zones.csv
@@ -106,7 +108,7 @@ app/
 
 ### Key Components
 
-- **Database Layer** (Database.hs): Uses HDBC over **PostgreSQL** (SQLite support was removed in v0.13.0). Tables: `students`, `categories`, `assignments`, `scores`, `exam_zones`, `exam_questions`, `exam_question_scores`. `initDatabase` is the poor-man's migration tool: every table is `CREATE TABLE IF NOT EXISTS` and column additions are done with idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (e.g. `students.enrolled`), so it's safe to re-run against an existing course DB. There is no ORM / no auto-migration framework.
+- **Database Layer** (Database.hs): Uses HDBC over **PostgreSQL** (SQLite support was removed in v0.13.0). Tables: `students`, `categories`, `assignments`, `scores`, `penalties`, `exam_zones`, `exam_questions`, `exam_question_scores`. `initDatabase` is the poor-man's migration tool: every table is `CREATE TABLE IF NOT EXISTS` and column additions are done with idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (e.g. `students.enrolled`), so it's safe to re-run against an existing course DB. There is no ORM / no auto-migration framework.
 
 - **Configuration** (Config.hs): Reads `config.yaml` for database settings, grading configuration (weighted/pass-fail/letter-grade modes), category weights, and exam configurations.
 
@@ -127,6 +129,7 @@ app/
 - `categories`: Grade categories (slug PK, title)
 - `assignments`: Assignments (slug PK, order_num, category FK, max_points, title, collected)
 - `scores`: Student scores (netid FK, assignment FK, score, excused)
+- `penalties`: Letter-grade-reduction penalties (netid PK, steps, reason; FK to students ON DELETE CASCADE). One row per student. `steps` notches drop the computed letter grade at `final-grades` time; if a penalty pushes a grade to F, the registrar row's last-attended-date column is re-derived. Loaded by `load-penalties`; the CSV is authoritative.
 
 **Exam Tables:**
 - `exam_zones`: Exam structure (exam_slug FK, zone_number, zone_title, question_count)
@@ -138,12 +141,13 @@ app/
 ```yaml
 database: cs421-grades-sp26   # PostgreSQL database name (passed as dbname=...)
 db-type: postgresql           # optional; only 'postgresql' is supported (SQLite removed in v0.13.0)
-repo-prefix: "https://github.com/org/prefix_"
+repo-prefix: "git@github.com:org/prefix_"   # netid is appended directly; SSH (host:path) or HTTPS (host/path) both work — SSH avoids credential prompts on a headless server
 term-code: "120261"  # required by `gb final-grades`; UIUC Banner term code
 
 grading:
   mode: weighted  # or pass-fail, letter-grade
-  grade-thresholds:  # required by `gb final-grades`; also drives the letter grade line in reports
+  show-letter-grade: false  # default false: `gb report` shows the numeric total but NOT the letter grade (which reads "F" for everyone before grades exist). Flip to true after the last midterm. Does NOT affect `gb final-grades` (registrar xlsx always emits the letter).
+  grade-thresholds:  # required by `gb final-grades`; also drives the letter grade line in reports (only shown when show-letter-grade is true)
     - {grade: "A+", min-percent: 97}
     - {grade: "A",  min-percent: 93}
     # ... through F

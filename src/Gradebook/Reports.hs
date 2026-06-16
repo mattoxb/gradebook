@@ -28,6 +28,14 @@ data ReportData = ReportData
 generateReport :: ReportData -> T.Text
 generateReport rd =
   let fmt = reportFormat (rdGradingConfig rd)
+      -- Suppress the student-facing letter grade unless show-letter-grade is
+      -- on (default off). An empty threshold list takes CS421.formatReport's
+      -- existing `null thresholds -> Nothing` path, so the report shows the
+      -- numeric total but no letter. final-grades is unaffected (it reads
+      -- thresholds directly, not through this).
+      reportThresholds = if showLetterGrade (rdGradingConfig rd)
+                         then rdThresholds rd
+                         else []
   in case fmt of
     "cs421-v1" -> CS421.formatReport
                     (rdNetid rd)
@@ -35,7 +43,7 @@ generateReport rd =
                     (rdGradingConfig rd)
                     (rdCategoryGrades rd)
                     (rdExamGrades rd)
-                    (rdThresholds rd)
+                    reportThresholds
 
     "cs491-v1" -> CS491.formatReport
                     (rdNetid rd)
