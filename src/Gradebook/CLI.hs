@@ -8,7 +8,7 @@ module Gradebook.CLI
 
 import Options.Applicative
 import qualified Data.Text as T
-import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides, runLoadExamZones, runGenExamZones)
+import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides, runLoadExamZones, runGenExamZones, runLoadPenalties)
 import Gradebook.Version (versionString)
 
 data Command
@@ -23,6 +23,9 @@ data Command
       }
   | LoadScores
       { scoresFile :: FilePath
+      }
+  | LoadPenalties
+      { penaltiesFile :: FilePath
       }
   | LoadExamZones
       { zonesExamSlug :: String
@@ -54,6 +57,9 @@ data Command
       { finalGradesOutPath :: FilePath
       }
   | SearchNetId
+      { searchEmail :: Bool
+      , searchMulti :: Bool
+      }
   | Version
   deriving (Show, Eq)
 
@@ -96,6 +102,17 @@ loadScoresParser = LoadScores
   <$> strArgument
       ( metavar "FILE"
      <> help "Path to scores CSV file"
+      )
+
+-- | Parser for LoadPenalties command
+loadPenaltiesParser :: Parser Command
+loadPenaltiesParser = LoadPenalties
+  <$> strOption
+      ( long "penalties"
+     <> short 'p'
+     <> metavar "FILE"
+     <> value "data-files/penalties.csv"
+     <> help "Path to penalties CSV file (default: data-files/penalties.csv)"
       )
 
 -- | Parser for LoadExamZones command
@@ -206,7 +223,16 @@ finalGradesParser = FinalGrades
 
 -- | Parser for SearchNetId command
 searchNetIdParser :: Parser Command
-searchNetIdParser = pure SearchNetId
+searchNetIdParser = SearchNetId
+  <$> switch
+      ( long "email"
+     <> help "Output email addresses instead of netids"
+      )
+  <*> switch
+      ( long "multi"
+     <> short 'm'
+     <> help "Allow selecting multiple students (fzf multi-select with Tab)"
+      )
 
 -- | Parser for Version command
 versionParser :: Parser Command
@@ -230,6 +256,10 @@ commandParser = hsubparser
   <> command "load-scores"
     ( info loadScoresParser
       ( progDesc "Load scores CSV into the database" )
+    )
+  <> command "load-penalties"
+    ( info loadPenaltiesParser
+      ( progDesc "Load letter-grade-reduction penalties CSV (netid,steps,reason) into the database" )
     )
   <> command "gen-exam-zones"
     ( info genExamZonesParser
@@ -284,6 +314,7 @@ run cmd = case cmd of
   LoadCategories{categoriesFile = path} -> runLoadCategories path
   LoadAssignments{assignmentsFile = path} -> runLoadAssignments path
   LoadScores{scoresFile = path} -> runLoadScores path
+  LoadPenalties{penaltiesFile = path} -> runLoadPenalties path
   LoadExamZones{zonesExamSlug = slug, zonesCsvFile = path} -> runLoadExamZones slug path
   GenExamZones{genZonesExamSlug = slug, genInfoAssessment = jsonPath, genZonesOutFile = out, genZonesForce = force} -> runGenExamZones slug jsonPath out force
   LoadExam{examSlug = slug, examScoresFile = path} -> runLoadExam slug path
@@ -291,5 +322,5 @@ run cmd = case cmd of
   GenerateReport{reportNetId = netid, pushToGit = push, reportAll = all'} -> runGenerateReport netid push all'
   MarkCollected{assignmentSlugs = slugs} -> runMarkCollected slugs
   FinalGrades{finalGradesOutPath = path} -> runFinalGrades path
-  SearchNetId -> runSearchNetId
+  SearchNetId{searchEmail = email, searchMulti = multi} -> runSearchNetId email multi
   Version -> putStrLn versionString

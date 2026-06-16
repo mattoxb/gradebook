@@ -36,6 +36,10 @@ module Gradebook.Database
   , getStudentCreditHours
   , getStudentName
   , getStudentEmail
+  -- Penalty-related exports
+  , Penalty(..)
+  , insertPenalty
+  , getAllPenalties
   ) where
 
 import Database.HDBC
@@ -112,6 +116,17 @@ data ExamQuestionScore = ExamQuestionScore
   , eqsOverrideReason :: Maybe T.Text  -- ^ Reason for manual override (if any)
   } deriving (Show, Eq)
 
+-- | A letter-grade-reduction penalty for one student (academic integrity,
+-- etc.). @penSteps@ is the number of notches to drop the computed letter grade
+-- down the configured @grade-thresholds@ list (1 step = A -> A-). Loaded from a
+-- hand-editable CSV by @gb load-penalties@; the CSV is authoritative so the DB
+-- can be regenerated in a future semester.
+data Penalty = Penalty
+  { penNetId  :: T.Text   -- ^ Student netid
+  , penSteps  :: Int      -- ^ Notches to drop the letter grade (>= 0)
+  , penReason :: T.Text   -- ^ Audit note (e.g., "academic integrity: exam-2")
+  } deriving (Show, Eq)
+
 -- | Convert a boolean-column SqlValue to Bool.
 -- PostgreSQL boolean columns come back as SqlBool; NULL maps to False.
 -- (SqlInteger fallbacks remain for any legacy/coerced rows.)
@@ -132,6 +147,7 @@ initDatabase conn = do
   _ <- run conn createExamZonesTableSQL []
   _ <- run conn createExamQuestionsTableSQL []
   _ <- run conn createExamQuestionScoresTableSQL []
+  _ <- run conn createPenaltiesTableSQL []
   -- Migration: add students.enrolled to databases created before v0.13.0.
   -- Idempotent; existing rows default to TRUE (correct — they were enrolled).
   _ <- run conn "ALTER TABLE students ADD COLUMN IF NOT EXISTS enrolled BOOLEAN NOT NULL DEFAULT TRUE" []
@@ -236,6 +252,18 @@ initDatabase conn = do
       , "  PRIMARY KEY (netid, exam_slug, zone_number, question_number),"
       , "  FOREIGN KEY (netid) REFERENCES students(netid) ON DELETE CASCADE,"
       , "  FOREIGN KEY (exam_slug, zone_number) REFERENCES exam_zones(exam_slug, zone_number) ON DELETE CASCADE"
+      , ")"
+      ]
+
+    -- Letter-grade-reduction penalties (academic integrity, etc.). One row
+    -- per student; re-loading the CSV upserts on netid. Reduction is applied
+    -- at final-grade time, not stored as a computed letter.
+    createPenaltiesTableSQL = unlines
+      [ "CREATE TABLE IF NOT EXISTS penalties ("
+      , "  netid TEXT PRIMARY KEY,"
+      , "  steps INTEGER NOT NULL,"
+      , "  reason TEXT NOT NULL,"
+      , "  FOREIGN KEY (netid) REFERENCES students(netid) ON DELETE CASCADE"
       , ")"
       ]
 
@@ -728,3 +756,32 @@ getStudentEmail conn netid = do
         SqlNull -> return Nothing
         _ -> return (Just (fromSql emailVal))
     _ -> return Nothing
+
+-- | Insert (or update) a letter-grade-reduction penalty. Upserts on netid so
+-- re-loading the penalties CSV converges to its current contents.
+insertPenalty :: IConnection conn => conn -> Penalty -> IO ()
+insertPenalty conn p = do
+  _ <- run conn insertSQL
+    [ toSql $ penNetId p
+    , toSql $ penSteps p
+    , toSql $ penReason p
+    ]
+  return ()
+  where
+    insertSQL = unlines
+      [ "INSERT INTO penalties (netid, steps, reason)"
+      , "VALUES (?, ?, ?)"
+      , "ON CONFLICT (netid) DO UPDATE SET"
+      , "  steps = EXCLUDED.steps,"
+      , "  reason = EXCLUDED.reason"
+      ]
+
+-- | Every penalty in the database, keyed by netid. Used by final-grades to
+-- apply the reduction and by load-penalties to diff against the CSV.
+getAllPenalties :: IConnection conn => conn -> IO (M.Map T.Text Penalty)
+getAllPenalties conn = do
+  results <- quickQuery' conn "SELECT netid, steps, reason FROM penalties" []
+  return $ M.fromList
+    [ (fromSql n, Penalty (fromSql n) (fromSql s) (fromSql r))
+    | [n, s, r] <- results
+    ]

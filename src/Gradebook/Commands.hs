@@ -6,6 +6,7 @@ module Gradebook.Commands
   , runLoadCategories
   , runLoadAssignments
   , runLoadScores
+  , runLoadPenalties
   , runLoadExam
   , runLoadExamZones
   , runGenExamZones
@@ -38,7 +39,7 @@ import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
 import Gradebook.Config (Config(..), GradingConfig(..), GradingMode(..), CategoryConfig(..), ExamConfig(..), RetakePolicy(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, Student(..), insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getEnrolledStatusMap, setStudentsEnrolled, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName, getStudentEmail)
+import Gradebook.Database (initDatabase, insertStudent, Student(..), insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getEnrolledStatusMap, setStudentsEnrolled, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName, getStudentEmail, Penalty(..), insertPenalty, getAllPenalties)
 import qualified Gradebook.InfoAssessment as IA
 import Gradebook.FinalGrades (FinalGradeRow(..), buildFinalGradeRow, writeFinalGradesXlsx, lastAttendedDate)
 import System.FilePath (takeDirectory)
@@ -50,6 +51,7 @@ import Gradebook.Roster (parseRosterCSV)
 import Gradebook.Categories (parseCategoriesCSV)
 import Gradebook.Assignments (parseAssignmentsCSV)
 import Gradebook.Scores (parseScoresCSV)
+import Gradebook.Penalties (parsePenaltiesCSV, applyGradeReduction)
 import Gradebook.GradeCalculation (calculateGrades, evaluateRequirements)
 import Gradebook.Reports (ReportData(..), generateReport)
 import qualified Data.HashMap.Strict as HM
@@ -309,6 +311,59 @@ runLoadScores scoresPath = do
                           ++ T.unpack (scoreAssignment s) ++ ": "
                           ++ oldVal ++ " -> " ++ newVal
 
+-- | Load letter-grade-reduction penalties CSV into the database.
+-- Idempotent: re-loading the same CSV is a no-op. The CSV (netid,steps,reason)
+-- is authoritative, so penalties for students no longer listed are removed.
+runLoadPenalties :: FilePath -> IO ()
+runLoadPenalties penaltiesPath = do
+  putStrLn $ "Loading penalties from: " ++ penaltiesPath
+
+  config <- loadConfig "config.yaml"
+
+  result <- parsePenaltiesCSV penaltiesPath
+  penalties <- case result of
+    Left err -> do
+      putStrLn $ "Error parsing CSV: " ++ err
+      exitFailure
+    Right p -> return p
+
+  putStrLn $ "Parsed " ++ show (length penalties) ++ " penalty entries"
+
+  conn <- openConnection config
+  initDatabase conn
+
+  -- Validate netids: a typo here would silently apply no reduction, so warn.
+  validStudents <- getAllStudentNetids conn
+  let studentSet = Set.fromList validStudents
+      (knownPenalties, unknown) =
+        foldr (\p (ok, bad) ->
+                 if Set.member (penNetId p) studentSet
+                   then (p : ok, bad)
+                   else (ok, penNetId p : bad))
+              ([], []) penalties
+  mapM_ (\n -> putStrLn $ "Warning: Student '" ++ T.unpack n
+                       ++ "' not found in database, skipping penalty") unknown
+
+  -- The CSV is authoritative: remove DB penalties for any student no longer
+  -- in the CSV so re-running converges to the file's current contents.
+  existing <- getAllPenalties conn
+  let csvNetids = Set.fromList (map penNetId knownPenalties)
+      removed   = [ n | n <- M.keys existing, not (Set.member n csvNetids) ]
+  mapM_ (\n -> run conn "DELETE FROM penalties WHERE netid = ?" [toSql n]) removed
+
+  mapM_ (insertPenalty conn) knownPenalties
+
+  commit conn
+  disconnect conn
+
+  putStrLn $ "Applied " ++ show (length knownPenalties)
+          ++ " penalt" ++ (if length knownPenalties == 1 then "y" else "ies")
+          ++ (if null removed then "" else ", removed " ++ show (length removed))
+  mapM_ (\p -> putStrLn $ "  " ++ T.unpack (penNetId p)
+                       ++ "  -" ++ show (penSteps p) ++ " step(s)"
+                       ++ "  (" ++ T.unpack (penReason p) ++ ")")
+        knownPenalties
+
 -- | Validate scores against known assignments and students
 -- Returns (valid scores, warnings for missing students, errors for missing assignments)
 validateScores :: Set.Set T.Text -> Set.Set T.Text -> [Score] -> ([Score], [String], [String])
@@ -326,9 +381,11 @@ validateScores assignmentSet studentSet = foldr checkScore ([], [], [])
       -- Both valid
       | otherwise = (score : valid, warns, errs)
 
--- | Search for a student using fzf and output their netid
-runSearchNetId :: IO ()
-runSearchNetId = do
+-- | Search for student(s) using fzf and output their netid (or email).
+-- @emitEmail@ outputs the email column instead of the netid; @multi@ enables
+-- fzf multi-select (Tab to mark) and prints one identifier per line.
+runSearchNetId :: Bool -> Bool -> IO ()
+runSearchNetId emitEmail multi = do
   -- Check if fzf is available
   fzfPath <- findExecutable "fzf"
   case fzfPath of
@@ -359,20 +416,28 @@ runSearchNetId = do
                 [ T.unpack $ T.intercalate " | " [netid, name, email, uin]
                 | (netid, name, email, uin) <- students
                 ]
+              fzfArgs = ["--height=40%", "--reverse"]
+                        ++ if multi then ["--multi"] else []
 
           -- Run fzf
-          result <- (readProcess fzfExe ["--height=40%", "--reverse"] fzfInput)
+          result <- (readProcess fzfExe fzfArgs fzfInput)
                     `catch` (\(e :: SomeException) -> do
                       putStrLn $ "Error running fzf: " ++ show e
                       putStrLn "Selection may have been cancelled"
                       exitFailure
                     )
 
-          -- Extract netid (first field before |)
-          let netid = takeWhile (/= '|') result
-          putStrLn $ trim netid
+          -- fzf prints one line per selected row (multiple when --multi).
+          -- Extract the requested field (netid or email) from each.
+          mapM_ (putStrLn . selectField emitEmail)
+                (filter (not . null . trim) (lines result))
   where
     trim = T.unpack . T.strip . T.pack
+    -- A selected fzf line is "NetID | Name | Email | UIN"; pull field 1 or 3.
+    selectField wantEmail line =
+      let fields = map (T.strip) (T.splitOn "|" (T.pack line))
+          fieldAt i = if i < length fields then T.unpack (fields !! i) else ""
+      in if wantEmail then fieldAt 2 else fieldAt 0
 
 -- | Generate grade report for a student (or all students)
 runGenerateReport :: Maybe String -> Bool -> Bool -> IO ()
@@ -416,8 +481,21 @@ runFinalGrades outPath = do
 
           conn <- openConnection config
           students <- getAllStudentIdentifiers conn
-          rows <- mapM (buildRowForStudent conn gradingCfg thresholds) students
+          penalties <- getAllPenalties conn
+          rows <- mapM (buildRowForStudent conn gradingCfg thresholds penalties) students
           let outRows = [r | Just r <- rows]
+
+          -- Surface applied penalties so the registrar upload is auditable.
+          let penalized = [ (n, p) | (n, _, _, _) <- students
+                                   , Just p <- [M.lookup n penalties] ]
+          when (not (null penalized)) $ do
+            putStrLn $ "Applied " ++ show (length penalized)
+                    ++ " letter-grade penalt"
+                    ++ (if length penalized == 1 then "y" else "ies") ++ ":"
+            mapM_ (\(n, p) -> putStrLn $ "  " ++ T.unpack n
+                                      ++ "  -" ++ show (penSteps p) ++ " step(s)"
+                                      ++ "  (" ++ T.unpack (penReason p) ++ ")")
+                  penalized
 
           when (null outRows) $ do
             putStrLn "No students to write."
@@ -451,10 +529,19 @@ runFinalGrades outPath = do
           disconnect conn
           putStrLn $ "Wrote " ++ show (length outRows) ++ " rows to " ++ outPath
   where
-    buildRowForStudent conn gradingCfg thresholds (netid, studentUin, studentCrn, _name) = do
+    buildRowForStudent conn gradingCfg thresholds penalties (netid, studentUin, studentCrn, _name) = do
       reportData <- buildStudentReportData conn gradingCfg netid
       lastDate <- lastAttendedDate conn netid
-      return $ buildFinalGradeRow studentUin studentCrn reportData thresholds lastDate
+      let mRow = buildFinalGradeRow studentUin studentCrn reportData thresholds lastDate
+      -- Apply any letter-grade-reduction penalty AFTER the earned letter is
+      -- computed: drop it N steps down the threshold list. Re-derive the
+      -- last-attended-date column, since a penalty can push a grade to F.
+      return $ case (mRow, M.lookup netid penalties) of
+        (Just row, Just p) | penSteps p > 0 ->
+          let reduced  = applyGradeReduction thresholds (penSteps p) (fgrLetterGrade row)
+              dateField = if reduced == "F" then lastDate else Nothing
+          in Just row { fgrLetterGrade = reduced, fgrLastAttended = dateField }
+        _ -> mRow
 
 -- | Generate report for a single student
 runGenerateReportForOne :: Maybe String -> Bool -> IO ()
