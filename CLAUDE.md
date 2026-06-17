@@ -65,6 +65,9 @@ direnv allow
 - `gb collect SLUG...`: Mark assignments as collected
 - `gb info [-n NETID]`: Print one student's roster details (net id, name, UIN, email, gender, section, CRN, credit, major, program, college, advisors). Selects with fzf when `-n` is omitted. Read-only; intended for laptop lookups against the source-of-truth DB.
 - `gb repo [-n NETID]`: Clone (if needed) or `git pull` a student's repository into `repos/<netid>`, using `repo-prefix` from config. Unlike `report --push`, it never writes/commits/pushes — just makes a fresh local checkout available. Selects with fzf when `-n` is omitted.
+- `gb missing ASSIGNMENT [--netid]`: List enrolled students missing an assignment — one identifier per line for piping into a mail/notify step. Dropped students (`enrolled = FALSE`) are excluded. Prints **emails by default**; `--netid` prints netids instead (and email falls back to netid for any student with no email on file). Hard-fails on an unknown assignment slug.
+  - **Regular assignment:** "missing" = no `scores` row, or a row whose `score` is NULL and `excused` is FALSE (an excused student is *not* counted as missing).
+  - **Exam slug** (anything present in `exam_zones`): routed to an attendance check against `exam_question_scores`, since exams never produce `scores` rows (see "Exam totals are computed at report time"). "Missing" = no question-score rows for that *exact* slug. Retakes are separate slugs — `gb missing exam-1` checks the primary sitting; `gb missing exam-1-retake` checks the retake. (Without this special-casing, an exam slug would report *every* enrolled student, because there are no `scores.exam-*` rows.)
 - `gb netid [--email] [-m|--multi]`: Interactive student search using fzf. `--email` prints the email column instead of the netid; `--multi` enables fzf multi-select (Tab to mark) and prints one identifier per selected line.
 - `gb version`: Show version information
 
@@ -201,15 +204,44 @@ student2,short-answer/cps-vs-tail-exam,10,10,LLM-graded retake
 
 ## Version Management
 
-The version is defined in `src/Gradebook/Version.hs`. **Increment the version when adding new features:**
+The version lives in **two files that must stay in sync**:
+- `src/Gradebook/Version.hs` — `version = (major, minor, patch)`; what `gb version` prints at runtime.
+- `package.yaml` — `version: major.minor.patch.0` (hpack source; the `.cabal` is generated, so this is the only place to edit). Drives the derivation name (`gradebook-exe-gb-<version>`).
+
+Bump **both** together. (They drifted once — `package.yaml` sat at 0.13.0.0 while `Version.hs` was 0.15.0 — fixed in v0.16.0.)
+
+**Increment the version when adding new features:**
 - **Major** (x.0.0): Breaking changes to commands or config format
 - **Minor** (0.x.0): New commands or features
 - **Patch** (0.0.x): Bug fixes
 
-After making changes, update the installed command with:
+After making changes, update the locally installed command with:
 ```bash
 nix build && nix profile upgrade gradebook
 ```
+
+### Release / deploy workflow (version bump → pabu)
+
+Whenever a change bumps the version and is destined for pabu, **always merge the
+feature branch back into `main` before deploying** — the `nixos-config` flake
+input `gradebook` tracks `main` (`github:mattoxb/gradebook`, no branch suffix),
+so a deploy only picks up what's on `main`.
+
+1. Branch, implement, bump both version files, `nix build`.
+2. Open a PR and **merge it to `main`** (`gh pr merge <n> --merge --delete-branch`); sync local `main`.
+3. On **framework**, update the flake input and deploy via colmena:
+   ```bash
+   cd /etc/nixos
+   nix flake update gradebook          # re-pins flake.lock to the new main commit
+   git add flake.lock                  # flake eval only sees git-tracked files
+   # optional pre-flight (build the new binary locally before pushing a closure):
+   nix build --no-link 'github:mattoxb/gradebook#packages.x86_64-linux.default'
+   colmena --impure -f hive.nix apply --on pabu
+   ```
+4. Verify on the box: `ssh mattox@pabu.beckman-park.net 'gb version'`.
+5. Commit the lock bump in `nixos-config`.
+
+(`nix flake update gradebook` replaces the deprecated `nix flake lock --update-input gradebook`.)
 
 ## TODOs
 

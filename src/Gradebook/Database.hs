@@ -37,6 +37,10 @@ module Gradebook.Database
   , getStudentName
   , getStudentEmail
   , getStudentByNetid
+  , assignmentExists
+  , isExamSlug
+  , getMissingForAssignment
+  , getMissingForExam
   -- Penalty-related exports
   , Penalty(..)
   , insertPenalty
@@ -787,6 +791,66 @@ getStudentByNetid conn netid = do
         (fromSql college') (fromSql programCode') (fromSql programName')
         (fromSql ferpa') (fromSql honorsCredit') (fromSql advisors')
     rowToStudent _ = error "Unexpected row format from students query"
+
+-- | Does an assignment with this slug exist? Used to give @gb missing@ a
+-- clear error on a typo'd slug rather than silently reporting "everyone".
+assignmentExists :: IConnection conn => conn -> T.Text -> IO Bool
+assignmentExists conn slug = do
+  results <- quickQuery' conn
+    "SELECT 1 FROM assignments WHERE slug = ? LIMIT 1" [toSql slug]
+  return (not (null results))
+
+-- | Enrolled students who are missing an assignment: no score row, a NULL
+-- score, and not excused. Dropped students (enrolled = FALSE) are excluded.
+-- Returns (netid, name, email), ordered by name. Assumes the slug exists
+-- (check with 'assignmentExists' first).
+getMissingForAssignment :: IConnection conn => conn -> T.Text -> IO [(T.Text, T.Text, T.Text)]
+getMissingForAssignment conn slug = do
+  results <- quickQuery' conn querySQL [toSql slug]
+  return $ map (\[n, nm, e] -> (fromSql n, fromSql nm, fromSql e)) results
+  where
+    -- LEFT JOIN so students with no scores row at all are included. A student
+    -- is "missing" when they have no row, a NULL score, or are not excused
+    -- (an excused student is not counted as missing).
+    querySQL = unlines
+      [ "SELECT st.netid, st.name, st.email"
+      , "FROM students st"
+      , "LEFT JOIN scores s ON s.netid = st.netid AND s.assignment = ?"
+      , "WHERE st.enrolled = TRUE"
+      , "  AND (s.netid IS NULL OR (s.score IS NULL AND s.excused = FALSE))"
+      , "ORDER BY st.name"
+      ]
+
+-- | Is this slug an exam? Exam scores live in @exam_question_scores@, not the
+-- @scores@ table, so @gb missing@ must check attendance differently for them.
+-- A slug counts as an exam if it has rows in @exam_zones@.
+isExamSlug :: IConnection conn => conn -> T.Text -> IO Bool
+isExamSlug conn slug = do
+  results <- quickQuery' conn
+    "SELECT 1 FROM exam_zones WHERE exam_slug = ? LIMIT 1" [toSql slug]
+  return (not (null results))
+
+-- | Enrolled students who did not sit a given exam: no rows in
+-- @exam_question_scores@ for that exact @exam_slug@. (Retakes are separate
+-- slugs — pass the retake slug to check retake attendance.) Dropped students
+-- are excluded. Returns (netid, name, email) ordered by name.
+getMissingForExam :: IConnection conn => conn -> T.Text -> IO [(T.Text, T.Text, T.Text)]
+getMissingForExam conn examSlug = do
+  results <- quickQuery' conn querySQL [toSql examSlug]
+  return $ map (\[n, nm, e] -> (fromSql n, fromSql nm, fromSql e)) results
+  where
+    -- A student "took" the exam iff they have at least one question-score row
+    -- for that slug. NOT EXISTS flags everyone enrolled who has none.
+    querySQL = unlines
+      [ "SELECT st.netid, st.name, st.email"
+      , "FROM students st"
+      , "WHERE st.enrolled = TRUE"
+      , "  AND NOT EXISTS ("
+      , "    SELECT 1 FROM exam_question_scores eqs"
+      , "    WHERE eqs.netid = st.netid AND eqs.exam_slug = ?"
+      , "  )"
+      , "ORDER BY st.name"
+      ]
 
 -- | Insert (or update) a letter-grade-reduction penalty. Upserts on netid so
 -- re-loading the penalties CSV converges to its current contents.
