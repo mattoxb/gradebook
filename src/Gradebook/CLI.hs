@@ -8,7 +8,7 @@ module Gradebook.CLI
 
 import Options.Applicative
 import qualified Data.Text as T
-import Gradebook.Commands (runLoadRoster, runSearchNetId, runInfo, runRepo, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides, runLoadExamZones, runGenExamZones, runLoadPenalties)
+import Gradebook.Commands (runLoadRoster, runSearchNetId, runInfo, runRepo, runMissing, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides, runLoadExamZones, runGenExamZones, runLoadPenalties)
 import Gradebook.Version (versionString)
 
 data Command
@@ -65,6 +65,10 @@ data Command
       }
   | Repo
       { repoNetId :: Maybe String
+      }
+  | Missing
+      { missingAssignment :: String
+      , missingNetid      :: Bool
       }
   | Version
   deriving (Show, Eq)
@@ -260,6 +264,18 @@ repoParser = Repo
      <> help "Student netid (uses fzf if not provided)"
       ))
 
+-- | Parser for Missing command
+missingParser :: Parser Command
+missingParser = Missing
+  <$> strArgument
+      ( metavar "ASSIGNMENT"
+     <> help "Assignment slug to check (e.g., exam1)"
+      )
+  <*> switch
+      ( long "netid"
+     <> help "Output netids instead of email addresses"
+      )
+
 -- | Parser for Version command
 versionParser :: Parser Command
 versionParser = pure Version
@@ -327,6 +343,10 @@ commandParser = hsubparser
     ( info repoParser
       ( progDesc "Clone (if needed) or pull a student's repository into repos/<netid> (read-only; no push)" )
     )
+  <> command "missing"
+    ( info missingParser
+      ( progDesc "List enrolled students missing an assignment (emails by default, or netids with --netid)" )
+    )
   <> command "version"
     ( info versionParser
       ( progDesc "Show version information" )
@@ -359,4 +379,5 @@ run cmd = case cmd of
   SearchNetId{searchEmail = email, searchMulti = multi} -> runSearchNetId email multi
   Info{infoNetId = netid} -> runInfo netid
   Repo{repoNetId = netid} -> runRepo netid
+  Missing{missingAssignment = slug, missingNetid = wantNetid} -> runMissing slug wantNetid
   Version -> putStrLn versionString

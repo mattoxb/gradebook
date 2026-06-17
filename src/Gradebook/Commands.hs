@@ -17,6 +17,7 @@ module Gradebook.Commands
   , runSearchNetId
   , runInfo
   , runRepo
+  , runMissing
   , openConnection
   , buildStudentReportData
   ) where
@@ -41,7 +42,7 @@ import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
 import Gradebook.Config (Config(..), GradingConfig(..), GradingMode(..), CategoryConfig(..), ExamConfig(..), RetakePolicy(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, Student(..), insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getEnrolledStatusMap, setStudentsEnrolled, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName, getStudentEmail, getStudentByNetid, Penalty(..), insertPenalty, getAllPenalties)
+import Gradebook.Database (initDatabase, insertStudent, Student(..), insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getEnrolledStatusMap, setStudentsEnrolled, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName, getStudentEmail, getStudentByNetid, assignmentExists, isExamSlug, getMissingForAssignment, getMissingForExam, Penalty(..), insertPenalty, getAllPenalties)
 import qualified Gradebook.InfoAssessment as IA
 import Gradebook.FinalGrades (FinalGradeRow(..), buildFinalGradeRow, writeFinalGradesXlsx, lastAttendedDate)
 import System.FilePath (takeDirectory)
@@ -552,6 +553,41 @@ runRepo maybeNetid = do
               putStrLn $ "Error: clone failed for " ++ netidStr ++ ": " ++ show e
               exitFailure
             Right _ -> putStrLn $ "Cloned into: " ++ repoDir
+
+-- | List enrolled students missing an assignment. Prints one identifier per
+-- line — email by default, netid with @--netid@ — so the output pipes straight
+-- into a mail/notify step. Dropped students (enrolled = FALSE) are excluded.
+-- Hard-fails on an unknown slug.
+--
+-- Exams are scored in @exam_question_scores@, not the @scores@ table, so an
+-- exam slug is routed to an attendance check there (no rows for that exact
+-- slug => missing). Without this, every enrolled student would be reported
+-- for an exam, since exams never produce @scores@ rows.
+runMissing :: String -> Bool -> IO ()
+runMissing slugStr emitNetid = do
+  let slug = T.pack slugStr
+
+  config <- loadConfig "config.yaml"
+  conn <- openConnection config
+
+  isExam <- isExamSlug conn slug
+  missing <- if isExam
+    then getMissingForExam conn slug
+    else do
+      exists <- assignmentExists conn slug
+      when (not exists) $ do
+        putStrLn $ "Error: no assignment with slug '" ++ slugStr ++ "' in the database"
+        disconnect conn
+        exitFailure
+      getMissingForAssignment conn slug
+  disconnect conn
+
+  -- One identifier per line, no decoration, so it pipes cleanly. Fall back to
+  -- the netid if a student has no email on file (would otherwise print blank).
+  mapM_ (\(netid, _name, email) ->
+           let ident = if emitNetid || T.null email then netid else email
+           in TIO.putStrLn ident)
+        missing
 
 -- | Generate grade report for a student (or all students)
 runGenerateReport :: Maybe String -> Bool -> Bool -> IO ()
