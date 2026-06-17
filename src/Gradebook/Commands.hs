@@ -15,6 +15,8 @@ module Gradebook.Commands
   , runFinalGrades
   , runMarkCollected
   , runSearchNetId
+  , runInfo
+  , runRepo
   , openConnection
   , buildStudentReportData
   ) where
@@ -39,7 +41,7 @@ import qualified Data.Vector as V
 import Data.Csv (ToRecord(..), ToField(..))
 
 import Gradebook.Config (Config(..), GradingConfig(..), GradingMode(..), CategoryConfig(..), ExamConfig(..), RetakePolicy(..), loadConfig)
-import Gradebook.Database (initDatabase, insertStudent, Student(..), insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getEnrolledStatusMap, setStudentsEnrolled, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName, getStudentEmail, Penalty(..), insertPenalty, getAllPenalties)
+import Gradebook.Database (initDatabase, insertStudent, Student(..), insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getEnrolledStatusMap, setStudentsEnrolled, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName, getStudentEmail, getStudentByNetid, Penalty(..), insertPenalty, getAllPenalties)
 import qualified Gradebook.InfoAssessment as IA
 import Gradebook.FinalGrades (FinalGradeRow(..), buildFinalGradeRow, writeFinalGradesXlsx, lastAttendedDate)
 import System.FilePath (takeDirectory)
@@ -438,6 +440,118 @@ runSearchNetId emitEmail multi = do
       let fields = map (T.strip) (T.splitOn "|" (T.pack line))
           fieldAt i = if i < length fields then T.unpack (fields !! i) else ""
       in if wantEmail then fieldAt 2 else fieldAt 0
+
+-- | Select a single student with fzf and return their netid (String).
+-- Shared by @info@ and @repo@. Exits the process if fzf is missing, the
+-- database is empty, or the selection is cancelled.
+selectStudentNetid :: IO String
+selectStudentNetid = do
+  fzfPath <- findExecutable "fzf"
+  case fzfPath of
+    Nothing -> do
+      putStrLn "Error: fzf not found in PATH"
+      putStrLn "Please install fzf or ensure it's in your PATH"
+      exitFailure
+    Just fzfExe -> do
+      config <- loadConfig "config.yaml"
+      conn <- openConnection config
+      students <- searchStudents conn ""
+      disconnect conn
+
+      if null students
+        then do
+          putStrLn "No students found in database. Run 'gb load-roster' first."
+          exitFailure
+        else do
+          let fzfInput = unlines
+                [ T.unpack $ T.intercalate " | " [netid, name, email, uin]
+                | (netid, name, email, uin) <- students
+                ]
+          result <- readProcess fzfExe ["--height=40%", "--reverse"] fzfInput
+                    `catch` (\(e :: SomeException) -> do
+                      putStrLn $ "Error running fzf: " ++ show e
+                      putStrLn "Selection may have been cancelled"
+                      exitFailure
+                    )
+          let netid = takeWhile (/= '|') result
+          return $ T.unpack $ T.strip $ T.pack netid
+
+-- | Print roster details (section, email, advisor, UIN, ...) for one student.
+-- Selects with fzf when no netid is given. Read-only.
+runInfo :: Maybe String -> IO ()
+runInfo maybeNetid = do
+  netidStr <- case maybeNetid of
+    Just n  -> return n
+    Nothing -> selectStudentNetid
+
+  let netid = T.pack netidStr
+
+  config <- loadConfig "config.yaml"
+  conn <- openConnection config
+  mStudent <- getStudentByNetid conn netid
+  disconnect conn
+
+  case mStudent of
+    Nothing -> do
+      putStrLn $ "No student found with netid '" ++ netidStr ++ "'"
+      exitFailure
+    Just s -> mapM_ putStrLn
+      [ field "Net ID"   (netId s)
+      , field "Name"     (name s)
+      , field "UIN"      (uin s)
+      , field "Email"    (email s)
+      , field "Gender"   (gender s)
+      , field "Section"  (section s)
+      , field "CRN"      (crn s)
+      , field "Credit"   (credit s)
+      , field "Major"    (major1Name s)
+      , field "Program"  (programName s)
+      , field "College"  (college s)
+      , field "Advisors" (advisors s)
+      ]
+  where
+    -- Left-pad labels to a common width so values line up.
+    field label val = label ++ ":" ++ replicate (10 - length label) ' ' ++ T.unpack val
+
+-- | Clone (if needed) or pull a student's repository into @repos/<netid>@.
+-- Unlike @report --push@, this never writes, commits, or pushes — it just
+-- makes a fresh local checkout available on the laptop. Selects with fzf when
+-- no netid is given.
+runRepo :: Maybe String -> IO ()
+runRepo maybeNetid = do
+  netidStr <- case maybeNetid of
+    Just n  -> return n
+    Nothing -> selectStudentNetid
+
+  config <- loadConfig "config.yaml"
+  case repoPrefix config of
+    Nothing -> do
+      putStrLn "Error: No repo-prefix in config.yaml"
+      exitFailure
+    Just prefix -> do
+      let repoUrl = T.unpack prefix ++ netidStr
+          repoDir = "repos/" ++ netidStr
+
+      repoExists <- System.Directory.doesDirectoryExist repoDir
+      if repoExists
+        then do
+          putStrLn $ "Updating existing repository: " ++ repoDir
+          result <- (try (readProcess "git" ["-C", repoDir, "pull"] "")
+                       :: IO (Either SomeException String))
+          case result of
+            Left e  -> do
+              putStrLn $ "Error: git pull failed: " ++ show e
+              exitFailure
+            Right out -> putStr out
+        else do
+          putStrLn $ "Cloning repository: " ++ repoUrl
+          result <- (try (readProcess "git" ["clone", repoUrl, repoDir] "")
+                       :: IO (Either SomeException String))
+          case result of
+            Left e  -> do
+              putStrLn $ "Error: clone failed for " ++ netidStr ++ ": " ++ show e
+              exitFailure
+            Right _ -> putStrLn $ "Cloned into: " ++ repoDir
 
 -- | Generate grade report for a student (or all students)
 runGenerateReport :: Maybe String -> Bool -> Bool -> IO ()

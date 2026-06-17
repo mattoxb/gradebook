@@ -8,7 +8,7 @@ module Gradebook.CLI
 
 import Options.Applicative
 import qualified Data.Text as T
-import Gradebook.Commands (runLoadRoster, runSearchNetId, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides, runLoadExamZones, runGenExamZones, runLoadPenalties)
+import Gradebook.Commands (runLoadRoster, runSearchNetId, runInfo, runRepo, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides, runLoadExamZones, runGenExamZones, runLoadPenalties)
 import Gradebook.Version (versionString)
 
 data Command
@@ -59,6 +59,12 @@ data Command
   | SearchNetId
       { searchEmail :: Bool
       , searchMulti :: Bool
+      }
+  | Info
+      { infoNetId :: Maybe String
+      }
+  | Repo
+      { repoNetId :: Maybe String
       }
   | Version
   deriving (Show, Eq)
@@ -234,6 +240,26 @@ searchNetIdParser = SearchNetId
      <> help "Allow selecting multiple students (fzf multi-select with Tab)"
       )
 
+-- | Parser for Info command
+studentInfoParser :: Parser Command
+studentInfoParser = Info
+  <$> optional (strOption
+      ( long "netid"
+     <> short 'n'
+     <> metavar "NETID"
+     <> help "Student netid (uses fzf if not provided)"
+      ))
+
+-- | Parser for Repo command
+repoParser :: Parser Command
+repoParser = Repo
+  <$> optional (strOption
+      ( long "netid"
+     <> short 'n'
+     <> metavar "NETID"
+     <> help "Student netid (uses fzf if not provided)"
+      ))
+
 -- | Parser for Version command
 versionParser :: Parser Command
 versionParser = pure Version
@@ -293,6 +319,14 @@ commandParser = hsubparser
     ( info searchNetIdParser
       ( progDesc "Search for a student and output their netid" )
     )
+  <> command "info"
+    ( info studentInfoParser
+      ( progDesc "Select a student and print their roster details (section, email, advisor, UIN, ...)" )
+    )
+  <> command "repo"
+    ( info repoParser
+      ( progDesc "Clone (if needed) or pull a student's repository into repos/<netid> (read-only; no push)" )
+    )
   <> command "version"
     ( info versionParser
       ( progDesc "Show version information" )
@@ -323,4 +357,6 @@ run cmd = case cmd of
   MarkCollected{assignmentSlugs = slugs} -> runMarkCollected slugs
   FinalGrades{finalGradesOutPath = path} -> runFinalGrades path
   SearchNetId{searchEmail = email, searchMulti = multi} -> runSearchNetId email multi
+  Info{infoNetId = netid} -> runInfo netid
+  Repo{repoNetId = netid} -> runRepo netid
   Version -> putStrLn versionString

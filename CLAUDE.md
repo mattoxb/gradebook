@@ -63,6 +63,8 @@ direnv allow
 - `gb report [-n NETID] [-p] [-a]`: Generate grade report
 - `gb final-grades [-o FILE]`: Write registrar upload spreadsheet (.xlsx) — needs `term-code` and `grade-thresholds` in config
 - `gb collect SLUG...`: Mark assignments as collected
+- `gb info [-n NETID]`: Print one student's roster details (net id, name, UIN, email, gender, section, CRN, credit, major, program, college, advisors). Selects with fzf when `-n` is omitted. Read-only; intended for laptop lookups against the source-of-truth DB.
+- `gb repo [-n NETID]`: Clone (if needed) or `git pull` a student's repository into `repos/<netid>`, using `repo-prefix` from config. Unlike `report --push`, it never writes/commits/pushes — just makes a fresh local checkout available. Selects with fzf when `-n` is omitted.
 - `gb netid [--email] [-m|--multi]`: Interactive student search using fzf. `--email` prints the email column instead of the netid; `--multi` enables fzf multi-select (Tab to mark) and prints one identifier per selected line.
 - `gb version`: Show version information
 

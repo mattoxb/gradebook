@@ -36,6 +36,7 @@ module Gradebook.Database
   , getStudentCreditHours
   , getStudentName
   , getStudentEmail
+  , getStudentByNetid
   -- Penalty-related exports
   , Penalty(..)
   , insertPenalty
@@ -756,6 +757,36 @@ getStudentEmail conn netid = do
         SqlNull -> return Nothing
         _ -> return (Just (fromSql emailVal))
     _ -> return Nothing
+
+-- | Get the full student record for a netid (Nothing if not found). Used by
+-- the @info@ command to print roster details on the laptop.
+getStudentByNetid :: IConnection conn => conn -> T.Text -> IO (Maybe Student)
+getStudentByNetid conn netid = do
+  results <- quickQuery' conn querySQL [toSql netid]
+  case results of
+    (row:_) -> return (Just (rowToStudent row))
+    []      -> return Nothing
+  where
+    querySQL = unlines
+      [ "SELECT netid, uin, admit_term, gender, name, email, credit, level,"
+      , "       year, subject, number, section, crn, degree_name, major_1_name,"
+      , "       college, program_code, program_name, ferpa, honors_credit, advisors"
+      , "FROM students WHERE netid = ?"
+      ]
+
+    rowToStudent :: [SqlValue] -> Student
+    rowToStudent [ netid', uin', admitTerm', gender', name', email', credit'
+                 , level', year', subject', number', section', crn', degreeName'
+                 , major1Name', college', programCode', programName', ferpa'
+                 , honorsCredit', advisors' ] =
+      Student
+        (fromSql netid') (fromSql uin') (fromSql admitTerm') (fromSql gender')
+        (fromSql name') (fromSql email') (fromSql credit') (fromSql level')
+        (fromSql year') (fromSql subject') (fromSql number') (fromSql section')
+        (fromSql crn') (fromSql degreeName') (fromSql major1Name')
+        (fromSql college') (fromSql programCode') (fromSql programName')
+        (fromSql ferpa') (fromSql honorsCredit') (fromSql advisors')
+    rowToStudent _ = error "Unexpected row format from students query"
 
 -- | Insert (or update) a letter-grade-reduction penalty. Upserts on netid so
 -- re-loading the penalties CSV converges to its current contents.
