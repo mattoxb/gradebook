@@ -35,7 +35,7 @@ import Control.Monad (when, foldM)
 import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as M
-import Data.List (find, sortOn)
+import Data.List (find, sortOn, isPrefixOf, isSuffixOf, stripPrefix)
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Csv as Csv
 import qualified Data.Vector as V
@@ -45,7 +45,7 @@ import Gradebook.Config (Config(..), GradingConfig(..), GradingMode(..), Categor
 import Gradebook.Database (initDatabase, insertStudent, Student(..), insertCategory, insertAssignment, insertScore, searchStudents, getScoresForStudent, getAllScores, Assignment(..), Score(..), getAllAssignmentSlugs, getAllStudentNetids, getEnrolledStatusMap, setStudentsEnrolled, getAllStudentIdentifiers, ExamZone(..), ExamQuestionScore(..), insertExamZone, insertExamQuestionScore, getExamQuestionScoresForStudent, getExamZonesForExam, applyExamQuestionOverride, applyExamQuestionOverrideById, insertExamQuestion, getExamQuestionMap, deleteExamQuestionsForExam, getAllExamSlugs, getStudentCreditHours, getStudentName, getStudentEmail, getStudentByNetid, assignmentExists, isExamSlug, getMissingForAssignment, getMissingForExam, Penalty(..), insertPenalty, getAllPenalties)
 import qualified Gradebook.InfoAssessment as IA
 import Gradebook.FinalGrades (FinalGradeRow(..), buildFinalGradeRow, writeFinalGradesXlsx, lastAttendedDate)
-import System.FilePath (takeDirectory)
+import System.FilePath (takeDirectory, (</>))
 import Gradebook.ExamScores (PrairieLearnRow(..), parsePrairieLearnCSV, extractNetId, groupByStudent, buildQuestionScores)
 import Gradebook.ExamOverrides (ExamOverride(..), parseExamOverridesCSV)
 import Gradebook.ExamZonesCSV (ExamZoneRow(..), parseExamZonesCSV, writeExamZonesCSV)
@@ -1038,6 +1038,40 @@ runSearchNetIdForReport = do
           let netid = takeWhile (/= '|') result
           return $ T.unpack $ T.strip $ T.pack netid
 
+-- | Copy this student's durable short-answer feedback into their checked-out
+-- repo so it ships with the grade report. The feedback store lives at
+-- @feedback/<exam>/<netid>-<exam>-<q>.md@ (written by gradeShortAnswers); the
+-- in-repo copy drops the @<netid>-@ prefix -> @short-answer/<exam>-<q>.md@.
+--
+-- We match a file to this netid only when the remainder after @<netid>-@
+-- begins with @exam-@ (every exam slug does), so netid @foo@ never picks up
+-- @foobar-exam-1-...@. Best-effort: a missing feedback/ dir is a no-op.
+copyFeedbackIntoRepo :: String -> FilePath -> IO ()
+copyFeedbackIntoRepo netid repoDir = do
+  let feedbackRoot = "feedback"
+  rootExists <- System.Directory.doesDirectoryExist feedbackRoot
+  when rootExists $ do
+    exams <- System.Directory.listDirectory feedbackRoot
+    mapM_ copyFromExamDir exams
+  where
+    prefix = netid ++ "-"
+    destDir = repoDir </> "short-answer"
+    copyFromExamDir exam = do
+      let examDir = "feedback" </> exam
+      isDir <- System.Directory.doesDirectoryExist examDir
+      when isDir $ do
+        files <- System.Directory.listDirectory examDir
+        let mine = [ f | f <- files
+                       , ".md" `isSuffixOf` f
+                       , Just rest <- [stripPrefix prefix f]
+                       , "exam-" `isPrefixOf` rest ]
+        when (not (null mine)) $
+          System.Directory.createDirectoryIfMissing True destDir
+        mapM_ (\f -> do
+                  let Just rest = stripPrefix prefix f
+                  System.Directory.copyFile (examDir </> f) (destDir </> rest))
+              mine
+
 -- | Push report to student's git repository
 pushReportToGit :: String -> String -> T.Text -> IO ()
 pushReportToGit netid repoPrefix report = do
@@ -1075,8 +1109,17 @@ pushReportToGit netid repoPrefix report = do
     TIO.writeFile reportFile report
     putStrLn $ "Wrote report to: " ++ reportFile
 
-    -- Git add, commit, and push
-    _ <- readProcess "git" ["-C", repoDir, "add", "GRADE_REPORT.md"] ""
+    -- Copy any short-answer feedback into the (now-existing) repo. This is the
+    -- backfill point: it catches repos that were cloned just above, which the
+    -- grading run never saw. The feedback store is the source of truth.
+    copyFeedbackIntoRepo netid repoDir
+
+    -- Git add, commit, and push. Stage the report and the short-answer feedback
+    -- so they ship in the same commit; `git add` of a missing path would error,
+    -- so only include short-answer when it exists.
+    saExists <- System.Directory.doesDirectoryExist (repoDir </> "short-answer")
+    let addPaths = "GRADE_REPORT.md" : [ "short-answer" | saExists ]
+    _ <- readProcess "git" (["-C", repoDir, "add"] ++ addPaths) ""
     _ <- readProcess "git" ["-C", repoDir, "commit", "-m", "Update grade report"] ""
           `catch` (\(e :: SomeException) -> do
             putStrLn $ "Nothing to commit (report unchanged)"
