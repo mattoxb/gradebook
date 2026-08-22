@@ -3,6 +3,7 @@
 
 module Gradebook.Commands
   ( runLoadRoster
+  , runLoadDropped
   , runLoadCategories
   , runLoadAssignments
   , runLoadScores
@@ -31,11 +32,13 @@ import System.Exit (exitFailure)
 import qualified System.Directory
 import System.Directory (findExecutable, doesFileExist)
 import Control.Exception (catch, try, SomeException)
-import Control.Monad (when, foldM)
+import Control.Monad (when, unless, foldM)
 import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as M
-import Data.List (find, sortOn, isPrefixOf, isSuffixOf, stripPrefix)
+import Data.List (find, sortOn, isPrefixOf, isSuffixOf, stripPrefix, intercalate)
+import Data.Time.Clock (getCurrentTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Csv as Csv
 import qualified Data.Vector as V
@@ -130,6 +133,13 @@ runLoadRoster rosterPath = do
                       dropped
   disconnect conn
 
+  -- Persist the drop record to the repo. `roster.csv` is a *current* snapshot,
+  -- so a student who enrolls and later drops exists in no revision of it --
+  -- which would make them unreproducible by `gb rebuild`. Appending them to a
+  -- tracked CSV turns the drop history into real source data instead of
+  -- DB-only residue, and keeps the rebuild a total function of the repo.
+  recordDroppedStudents (takeDirectory rosterPath </> "dropped.csv") droppedInfo
+
   putStrLn $ "Successfully loaded " ++ show (length students) ++ " students into database"
   putStrLn ""
   reportRosterChange "Added (new)" (map fromCsv newlyAdded)
@@ -145,6 +155,94 @@ runLoadRoster rosterPath = do
                       putStrLn $ "  " ++ T.unpack n ++ "  " ++ nm ++ "  <" ++ em ++ ">")
                    (sortOn (\(_, nm, _) -> nm) entries)
       putStrLn ""
+
+-- | Append newly-dropped students to the tracked drop record.
+--
+-- Append-only and idempotent: a netid already listed is left alone, so
+-- re-running @load-roster@ never duplicates a row, and a student who drops,
+-- re-enrols and drops again keeps their original first-dropped date.
+recordDroppedStudents :: FilePath -> [(T.Text, String, String)] -> IO ()
+recordDroppedStudents path dropped = do
+  exists <- doesFileExist path
+  existing <- if exists
+    then do
+      contents <- readFile path
+      length contents `seq` return
+        (Set.fromList [ takeWhile (/= ',') l
+                      | l <- drop 1 (lines contents), not (null l) ])
+    else return Set.empty
+
+  let fresh = [ e | e@(n, _, _) <- dropped
+                  , not (Set.member (T.unpack n) existing) ]
+  unless (null fresh) $ do
+    today <- (formatTime defaultTimeLocale "%Y-%m-%d" <$> getCurrentTime)
+    unless exists $ writeFile path "netid,name,email,dropped_on\n"
+    appendFile path $ unlines
+      [ intercalate "," [T.unpack n, csvQuote nm, csvQuote em, today]
+      | (n, nm, em) <- sortOn (\(n, _, _) -> n) fresh ]
+    putStrLn $ "Recorded " ++ show (length fresh)
+            ++ " newly-dropped student(s) in " ++ path
+  where
+    -- Names routinely contain commas ("Doe, Jane"), so quote defensively.
+    csvQuote s
+      | any (`elem` (",\"" :: String)) s =
+          '"' : concatMap (\c -> if c == '"' then "\"\"" else [c]) s ++ "\""
+      | otherwise = s
+
+-- | Load the drop record, marking every listed student @enrolled = FALSE@.
+--
+-- Runs after @load-roster@ during a rebuild. Students listed here but absent
+-- from the roster are re-created from the recorded name/email so their scores
+-- have a row to hang off; anyone who has since re-enrolled is in the roster and
+-- is skipped, so the roster always wins.
+runLoadDropped :: FilePath -> IO ()
+runLoadDropped path = do
+  exists <- doesFileExist path
+  if not exists
+    then putStrLn $ "No drop record at " ++ path ++ "; skipping"
+    else do
+      config <- loadConfig "config.yaml"
+      contents <- readFile path
+      let rows = [ splitCsvLine l | l <- drop 1 (lines contents), not (null l) ]
+          entries = [ (T.pack n, T.pack nm, T.pack em)
+                    | (n:nm:em:_) <- rows, not (null n) ]
+
+      conn <- openConnection config
+      initDatabase conn
+      priorStatus <- getEnrolledStatusMap conn
+
+      -- Only students absent from the DB need a placeholder row; anyone
+      -- present (i.e. in the roster) keeps their real record.
+      let missing = [ e | e@(n, _, _) <- entries, not (M.member n priorStatus) ]
+      mapM_ (\(n, nm, em) -> insertStudent conn (blankStudent n nm em)) missing
+      setStudentsEnrolled conn False [ n | (n, _, _) <- entries ]
+      commit conn
+      disconnect conn
+
+      putStrLn $ "Drop record: " ++ show (length entries) ++ " student(s) marked dropped ("
+              ++ show (length missing) ++ " re-created from the record)"
+  where
+    blankStudent n nm em = Student
+      { netId = n, uin = "", admitTerm = "", gender = "", name = nm
+      , email = em, credit = "", level = "", year = "", subject = ""
+      , number = "", section = "", crn = "", degreeName = "", major1Name = ""
+      , college = "", programCode = "", programName = "", ferpa = ""
+      , honorsCredit = "", advisors = "" }
+
+-- | Minimal CSV field splitter: handles the quoted-name case written by
+-- 'recordDroppedStudents'. Not a general CSV parser -- this file is ours.
+splitCsvLine :: String -> [String]
+splitCsvLine = go
+  where
+    go s = case s of
+      '"':rest -> let (field, rest') = quoted rest in field : continue rest'
+      _        -> let (field, rest') = break (== ',') s in field : continue rest'
+    continue (',':rest) = go rest
+    continue _          = []
+    quoted s = case break (== '"') s of
+      (pre, '"':'"':rest) -> let (more, rest') = quoted rest in (pre ++ "\"" ++ more, rest')
+      (pre, '"':rest)     -> (pre, rest)
+      (pre, rest)         -> (pre, rest)
 
 -- | Load categories CSV into database
 runLoadCategories :: FilePath -> IO ()

@@ -9,6 +9,7 @@ module Gradebook.CLI
 import Options.Applicative
 import qualified Data.Text as T
 import Gradebook.Commands (runLoadRoster, runSearchNetId, runInfo, runRepo, runMissing, runLoadCategories, runLoadAssignments, runLoadScores, runGenerateReport, runFinalGrades, runMarkCollected, runLoadExam, runLoadExamOverrides, runLoadExamZones, runGenExamZones, runLoadPenalties)
+import Gradebook.Rebuild (runRebuild)
 import Gradebook.Version (versionString)
 
 data Command
@@ -52,6 +53,9 @@ data Command
       }
   | MarkCollected
       { assignmentSlugs :: [String]
+      }
+  | Rebuild
+      { rebuildForce :: Bool
       }
   | FinalGrades
       { finalGradesOutPath :: FilePath
@@ -220,6 +224,14 @@ markCollectedParser = MarkCollected
      <> help "Assignment slug(s) to mark as collected"
       ))
 
+-- | Parser for Rebuild command
+rebuildParser :: Parser Command
+rebuildParser = Rebuild
+  <$> switch
+      ( long "force"
+     <> help "Rebuild even if some expected inputs are missing (reports what it skipped)"
+      )
+
 -- | Parser for FinalGrades command
 finalGradesParser :: Parser Command
 finalGradesParser = FinalGrades
@@ -327,6 +339,10 @@ commandParser = hsubparser
     ( info markCollectedParser
       ( progDesc "Mark assignment(s) as collected (updates DB and CSV)" )
     )
+  <> command "rebuild"
+    ( info rebuildParser
+      ( progDesc "Drop and rebuild the entire database from the committed CSVs (offline; the DB is a cache, the repo is the source of truth)" )
+    )
   <> command "final-grades"
     ( info finalGradesParser
       ( progDesc "Write a .xlsx of final letter grades for upload (requires term-code and grade-thresholds in config)" )
@@ -375,6 +391,7 @@ run cmd = case cmd of
   LoadExamOverrides{overrideExamSlug = slug, overridesFile = path} -> runLoadExamOverrides slug path
   GenerateReport{reportNetId = netid, pushToGit = push, reportAll = all'} -> runGenerateReport netid push all'
   MarkCollected{assignmentSlugs = slugs} -> runMarkCollected slugs
+  Rebuild{rebuildForce = f} -> runRebuild f
   FinalGrades{finalGradesOutPath = path} -> runFinalGrades path
   SearchNetId{searchEmail = email, searchMulti = multi} -> runSearchNetId email multi
   Info{infoNetId = netid} -> runInfo netid
