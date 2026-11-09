@@ -73,11 +73,11 @@ formatAssignmentStatus titleWidth ag =
     title = agTitle ag
     paddedTitle = title <> T.replicate (titleWidth - T.length title) " "
     status = assignmentStatus ag
-  in "  " <> paddedTitle <> "  " <> status
+  in T.stripEnd ("- " <> paddedTitle <> "  " <> status)
 
 -- | Determine the status indicator for an assignment.
--- Completed → green check; absent/incomplete → blank so the paragraph view
--- (markdown collapses lines) reads cleanly. Pending/excused keep bracketed
+-- Completed → green check; absent/incomplete → blank. Rows are emitted as
+-- markdown list items so viewers render one assignment per line. Pending/excused keep bracketed
 -- text so they remain visually distinct from a routine miss.
 assignmentStatus :: AssignmentGrade -> T.Text
 assignmentStatus ag
@@ -109,7 +109,7 @@ formatRequirement rr =
     excusedNote = if rrExcused rr > 0
                   then T.pack $ printf " (%d excused)" (rrExcused rr)
                   else ""
-  in T.pack $ printf "  %s %s: %d/%d achieved, %d required%s"
+  in T.pack $ printf "- %s %s: %d/%d achieved, %d required%s"
        (status :: String)
        (T.unpack $ rrName rr)
        (rrActual rr)
