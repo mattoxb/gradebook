@@ -76,13 +76,14 @@ formatAssignmentStatus titleWidth ag =
   in T.stripEnd ("- " <> paddedTitle <> "  " <> status)
 
 -- | Determine the status indicator for an assignment.
--- Completed → green check; absent/incomplete → blank. Rows are emitted as
--- markdown list items so viewers render one assignment per line. Pending/excused keep bracketed
--- text so they remain visually distinct from a routine miss.
+-- Completed → ✅, pending → ⏳, excused → ➖ (each with a word for the
+-- latter two so they are distinguishable at a glance), absent/incomplete →
+-- blank. Rows are emitted as markdown list items so viewers render one
+-- assignment per line.
 assignmentStatus :: AssignmentGrade -> T.Text
 assignmentStatus ag
-  | agExcused ag = "[excused]"
-  | agPending ag = "[pending]"
+  | agExcused ag = "➖ excused"
+  | agPending ag = "⏳ pending"
   | isCompleted ag =
       let mult = case agScore ag of
             Just s | s > 1 -> Just (floor s :: Int)
