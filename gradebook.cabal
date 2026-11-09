@@ -5,7 +5,7 @@ cabal-version: 1.12
 -- see: https://github.com/sol/hpack
 
 name:           gradebook
-version:        0.18.1.0
+version:        0.18.2.0
 description:    CS421 Gradebook Manager
 homepage:       https://github.com/mattox/gradebook#readme
 bug-reports:    https://github.com/mattox/gradebook/issues
