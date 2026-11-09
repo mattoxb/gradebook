@@ -204,7 +204,7 @@ student2,short-answer/cps-vs-tail-exam,10,10,LLM-graded retake
 
 ## Version Management
 
-The version lives in **two files that must stay in sync**:
+The version lives in **three files that must stay in sync**:
 - `src/Gradebook/Version.hs` — `version = (major, minor, patch)`; what `gb version` prints at runtime.
 - `package.yaml` — `version: major.minor.patch.0` (hpack source).
 - `gradebook.cabal` — also `version: major.minor.patch.0`. It's generated from `package.yaml` but **checked in**, and haskell.nix reads it for the derivation name (`gradebook-exe-gb-<version>`). If it disagrees with `package.yaml`, `nix build` fails in installCheckPhase with `package.conf.d/gradebook-<old>-*.conf was not created`.
